@@ -1,0 +1,14 @@
+# training data
+training_data_filtered
+testing_data_pose_filtered
+testing_data_final_filtered
+models
+
+# outputs
+output_images
+output_images_pointnet
+*.pth
+*.png
+runs
+
+benchmark_utils
