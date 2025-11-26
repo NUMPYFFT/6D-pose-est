@@ -12,3 +12,5 @@ output_images_pointnet
 runs
 
 benchmark_utils
+*.pyc
+__pycache__/

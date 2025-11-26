@@ -71,3 +71,31 @@ Our solution implements a robust 6D pose estimation pipeline using Iterative Clo
     *   **Voxel Downsampling**: We replaced random sampling with uniform voxel downsampling. This ensures that corners and edges (high-frequency features) are represented in the point cloud, giving ICP better constraints than just flat faces.
     *   **Relaxed Thresholds**: We increased the fine alignment threshold from 0.5cm to 1cm. A too-tight threshold was rejecting valid correspondences due to sensor noise or mesh imperfections, causing divergence.
     *   **Fallback Logic**: We added checks after each stage. If a stage fails (fitness = 0), the pipeline falls back to the result of the previous stage instead of returning a garbage pose.
+
+## Experimental Results
+
+We conducted a series of ablation studies to validate the effectiveness of our PointNet + ICP pipeline.
+
+### Summary of Experiments
+
+| Experiment | Method | Pass Rate | Avg Rot Err | Avg Trans Err | Key Finding |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Baseline 1** | **PointNet Only** | 72.26% | **4.70°** | **0.47 cm** | Strong baseline. PointNet learns good global pose features but lacks fine geometric precision. |
+| **Baseline 2** | **ICP Only** | 16.58% | 70.85° | 1.61 cm | Fails catastrophically without a good rotation initialization. Proves that geometric refinement alone is insufficient for global pose estimation. |
+| **Exp 1 (Best)** | **PointNet + 3-Stage ICP** | **78.36%** | 6.42° | **0.47 cm** | **Best configuration.** Robust 3-stage ICP refines PointNet predictions, correcting small misalignments and boosting pass rate by ~6%. |
+| **Exp 2** | **1-Stage ICP** | 50.85% | 8.96° | 0.64 cm | A single coarse ICP stage is detrimental. It often drags the good PointNet initialization into bad local minima before fine details can be resolved. |
+| **Exp 3** | **Relaxed Threshold (5cm)** | 67.86% | 11.18° | 0.57 cm | Relaxing the matching threshold allows ICP to latch onto clutter or wrong surfaces, degrading performance compared to the tighter 2cm threshold. |
+| **Exp 4** | **Tight Threshold (1cm)** | 76.36% | 5.52° | 0.46 cm | **Lowest Rotation Error.** Prevents "flipping" (e.g., cans lying down) by restricting ICP to the immediate vicinity of the PointNet prediction. Slightly lower pass rate than Exp 1 because it cannot recover from larger initial errors. |
+| **Exp 5** | **Safety Check (30°)** | 74.90% | 5.80° | **0.44 cm** | **Lowest Translation Error.** We tried to combine the loose 2cm threshold with a check to reject large rotations. However, this backfired for symmetric objects (e.g., boxes), where a 180° flip is valid but was rejected by the safety check, lowering the pass rate. |
+
+### Analysis
+
+1.  **Importance of Initialization**: The massive gap between **Baseline 2 (16.58%)** and **Baseline 1 (72.26%)** demonstrates that learning-based initialization (PointNet) is critical. ICP is a local optimizer and cannot solve the global registration problem on its own.
+2.  **Refinement Strategy**: The drop in performance for **Exp 2 (1-Stage)** and **Exp 3 (Relaxed Threshold)** highlights that ICP is sensitive to hyperparameters. A "coarse-only" or "loose" ICP can actually harm a good initialization. The **3-Stage Coarse-to-Fine** strategy (Exp 1) is essential to robustly improve the pose without diverging.
+3.  **Threshold Trade-off**: **Exp 4 (1cm)** vs **Exp 1 (2cm)** reveals a classic precision-recall trade-off.
+    *   **1cm Threshold**: Safer. It trusts PointNet more. It rarely makes things worse (low rotation error), but it also misses opportunities to fix predictions that are off by 1.5cm.
+    *   **2cm Threshold**: More aggressive. It fixes more cases (higher pass rate), but occasionally snaps to the wrong surface (higher rotation error).
+
+## Conclusion
+
+We have successfully developed a robust 6D pose estimation system. By combining the global search capability of a neural network (**PointNet**) with the precise local refinement of **Multi-Stage ICP**, we achieved a **78.36% pass rate** on the validation set. Our ablation studies confirm that both components are necessary: PointNet provides the coarse pose that prevents ICP from getting stuck in local minima, while the 3-stage ICP refinement corrects the residual errors to achieve high-precision alignment.

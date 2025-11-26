@@ -41,7 +41,7 @@ class PointNet(nn.Module):
         )
 
     def forward(self, x, obj_id):
-        # x: (B, N, 6) -> (B, 6, N)
+        # x: (B, N, 9) -> (B, 9, N)
         x = x.transpose(2, 1)
         
         x = F.relu(self.bn1(self.conv1(x)))

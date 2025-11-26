@@ -261,7 +261,13 @@ def process_scene(idx, split_name, objects_df, verbose):
         T_co_gt = T_wc @ T_ow
         
         # Initial Pose for ICP
-        init_pose = T_co_gt
+        # init_pose = T_co_gt # This was using GT (Cheating)
+
+        # FAIR BASELINE: Init with Centroid + Identity Rotation
+        # We assume we know the location (from segmentation) but not the orientation.
+        centroid = np.mean(target_points, axis=0)
+        init_pose = np.eye(4)
+        init_pose[:3, 3] = centroid
         
         # Evaluate Initial Pose
         eval_init = o3d.pipelines.registration.evaluate_registration(
@@ -368,7 +374,7 @@ def process_scene(idx, split_name, objects_df, verbose):
     plt.figure(figsize=(10, 8), dpi=300)
     plt.imshow(cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB))
     plt.axis('off')
-    plt.savefig(f"output_images/{name}_pred.png", bbox_inches='tight', pad_inches=0)
+    plt.savefig(f"output_images/icp_baseline/{name}_pred.png", bbox_inches='tight', pad_inches=0)
     plt.close()
 
     return name, scene_results, pass_count, total_count, logs, scene_rot_err, scene_trans_err
@@ -405,9 +411,9 @@ def run_icp_evaluation():
     print(f"Selected {len(indices)} scenes for evaluation from split '{split_name}'.")
     
     # Clean up old images
-    if os.path.exists("output_images"):
-        shutil.rmtree("output_images")
-    os.makedirs("output_images", exist_ok=True)
+    if os.path.exists("output_images/icp_baseline"):
+        shutil.rmtree("output_images/icp_baseline")
+    os.makedirs("output_images/icp_baseline", exist_ok=True)
     
     if not args.no_ray:
         ray.init()

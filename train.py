@@ -1,122 +1,214 @@
 import os
+import json
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from collections import Counter
 import cv2
 import utils
+import loss as loss_utils
 from data import PoseDataset
 from model import PointNet
+import config
 
-NUM_POINTS = 4096
-BATCH_SIZE = 128
-LR = 0.001
-EPOCHS = 100
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train_one_epoch(model, loader, opt, device, args, pm_loss_fn, l1_loss_fn):
+    model.train()
+    total_loss = 0
+    total_pm_loss = 0
+    total_geo_loss = 0
+    total_trans_loss = 0
+    
+    for batch in tqdm(loader, desc="Train"):
+        pts = batch['points'].to(device)
+        gt_R = batch['gt_rot'].to(device)
+        gt_t = batch['gt_t_residual'].to(device)
+        obj_id = batch['obj_id'].to(device)
+        sym = batch['sym_str']
+        xyz = pts[:,:,:3]
+
+        opt.zero_grad()
+
+        with torch.cuda.amp.autocast():
+            pred_rot6d, pred_t = model(pts, obj_id)
+            pred_R = utils.rotation_6d_to_matrix(pred_rot6d)
+
+            loss_pm = pm_loss_fn(pred_R, pred_t, gt_R, gt_t, xyz, sym)
+            loss_t = l1_loss_fn(pred_t, gt_t)
+            loss_geo = loss_utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
+
+            loss = args.w_pm * loss_pm + args.w_geo * loss_geo + args.w_trans * loss_t
+        
+        loss.backward()
+        opt.step()
+        
+        total_loss += loss.item()
+        total_pm_loss += loss_pm.item()
+        total_geo_loss += loss_geo.item()
+        total_trans_loss += loss_t.item()
+
+    avg_loss = total_loss / len(loader)
+    avg_pm = total_pm_loss / len(loader)
+    avg_geo = total_geo_loss / len(loader)
+    avg_trans = total_trans_loss / len(loader)
+    
+    return avg_loss, avg_pm, avg_geo, avg_trans
+
+def validate(model, loader, device, args, pm_loss_fn, l1_loss_fn):
+    model.eval()
+    total_loss = 0
+    total_pm_loss = 0
+    total_geo_loss = 0
+    total_trans_loss = 0
+    
+    val_geo_error_sum = 0.0
+    val_trans_error_sum = 0.0
+    val_count = 0
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Validation"):
+            pts = batch['points'].to(device)
+            gt_R = batch['gt_rot'].to(device)
+            gt_t = batch['gt_t_residual'].to(device)
+            obj_id = batch['obj_id'].to(device)
+            sym = batch['sym_str']
+            valid_points = batch['valid_points']
+            xyz = pts[:,:,:3]
+
+            # Filter out invalid samples
+            mask = valid_points >= 50
+            if not mask.any():
+                continue
+            
+            pts = pts[mask]
+            gt_R = gt_R[mask]
+            gt_t = gt_t[mask]
+            obj_id = obj_id[mask]
+            xyz = xyz[mask]
+            sym = [s for i, s in enumerate(sym) if mask[i]]
+            
+            pred_rot6d, pred_t = model(pts, obj_id)
+            pred_R = utils.rotation_6d_to_matrix(pred_rot6d)
+
+            loss_pm = pm_loss_fn(pred_R, pred_t, gt_R, gt_t, xyz, sym)
+            loss_t = l1_loss_fn(pred_t, gt_t)
+            loss_geo = loss_utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
+            
+            loss = args.w_pm * loss_pm + args.w_geo * loss_geo + args.w_trans * loss_t
+            
+            # Weighted by batch size for accurate average
+            batch_size = pts.shape[0]
+            total_loss += loss.item() * batch_size
+            total_pm_loss += loss_pm.item() * batch_size
+            total_geo_loss += loss_geo.item() * batch_size
+            total_trans_loss += loss_t.item() * batch_size
+
+            # Metrics
+            val_geo_error_sum += loss_geo.item() * batch_size # Geo loss is in radians, convert later
+            trans_dist = torch.norm(pred_t - gt_t, dim=1) * 100.0 # cm
+            val_trans_error_sum += trans_dist.sum().item()
+            
+            val_count += batch_size
+
+    if val_count == 0:
+        return 0, 0, 0, 0, 0, 0
+
+    avg_loss = total_loss / val_count
+    avg_pm = total_pm_loss / val_count
+    avg_geo = total_geo_loss / val_count
+    avg_trans = total_trans_loss / val_count
+    
+    avg_rot_error_deg = (val_geo_error_sum / val_count) * (180.0 / np.pi)
+    avg_trans_error_cm = val_trans_error_sum / val_count
+    
+    return avg_loss, avg_pm, avg_geo, avg_trans, avg_rot_error_deg, avg_trans_error_cm
 
 def train():
+    args = config.get_config()
+    
+    print(f"Total Epochs: {args.epochs}")
+    
+    # Save config
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
+        json.dump(vars(args), f, indent=4)
+        
+    DEVICE = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
     # 1. Setup Datasets
-    train_dataset = PoseDataset("train", num_points=NUM_POINTS, subset_size=None)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    train_dataset = PoseDataset("train", args.training_data_dir, args.split_dir, num_points=args.num_points, subset_size=None)
+    
+    print("Calculating class weights for balanced sampling...")
+    train_targets = [s[1] for s in train_dataset.samples]
+    class_counts = Counter(train_targets)
+    class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
+    sample_weights = torch.DoubleTensor([class_weights[t] for t in train_targets])
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    print("WeightedRandomSampler initialized.")
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=True, prefetch_factor=4)
 
-    val_dataset = PoseDataset("val", num_points=NUM_POINTS, subset_size=None)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    val_dataset = PoseDataset("val", args.training_data_dir, args.split_dir, num_points=args.num_points, subset_size=None)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
 
-    # Prepare visualization indices (Last Scene)
+    # Visualization setup
     vis_scene_idx = val_dataset.samples[-1][0]
     vis_indices = [i for i, (s_idx, _) in enumerate(val_dataset.samples) if s_idx == vis_scene_idx]
     print(f"Visualization Scene Index: {vis_scene_idx}, Objects: {len(vis_indices)}")
 
     # 2. Setup Model
-    model = PointNet().to(DEVICE)
+    print("Using PointNet")
+    model = PointNet(num_classes=args.num_classes).to(DEVICE)
     
-    # Restart from scratch (commented out loading)
-    # if os.path.exists("pointnet_best.pth"): ...
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-5)
 
-    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS, eta_min=1e-5)
-
-    pm_loss_fn = utils.point_matching_loss
+    pm_loss_fn = loss_utils.point_matching_loss
     l1 = nn.L1Loss()
+    writer = SummaryWriter()
 
-    best_val_rot = 99999.0
+    best_val_loss = float('inf')
+    save_path = args.checkpoint_path
 
-    for epoch in range(EPOCHS):
-        # --- TRAIN ---
-        model.train()
-        total_loss = 0
-        total_trans_loss = 0
+    for epoch in range(args.epochs):
+        # Train
+        t_loss, t_pm, t_geo, t_trans = train_one_epoch(model, train_loader, opt, DEVICE, args, pm_loss_fn, l1)
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} Train"):
-            pts = batch['points'].to(DEVICE)
-            gt_R = batch['gt_rot'].to(DEVICE)
-            gt_t = batch['gt_t_residual'].to(DEVICE)
-            obj_id = batch['obj_id'].to(DEVICE)
-            sym = batch['sym_str']
-            xyz = pts[:,:,:3]
-
-            opt.zero_grad()
-
-            pred_rot6d, pred_t = model(pts, obj_id)
-            pred_R = utils.rotation_6d_to_matrix(pred_rot6d)
-
-            loss_pm = pm_loss_fn(pred_R, pred_t, gt_R, gt_t, xyz, sym)
-            loss_t = l1(pred_t, gt_t)
-            loss_geo = utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
-
-            loss = 100*loss_pm + 5.0*loss_t + 10.0 * loss_geo
-
-            loss.backward()
-            opt.step()
-            total_loss += loss.item()
-            total_trans_loss += loss_t.item()
-
+        writer.add_scalar('Train/Loss', t_loss, epoch)
+        writer.add_scalar('Train/PM_Loss', t_pm, epoch)
+        writer.add_scalar('Train/Geo_Loss', t_geo, epoch)
+        writer.add_scalar('Train/Trans_Loss', t_trans, epoch)
+        
         scheduler.step()
         
-        # --- VALIDATION ---
-        model.eval()
-        val_geo_loss = 0.0
-        val_trans_err_cm = 0.0
-        val_count = 0
+        # Validate
+        v_loss, v_pm, v_geo, v_trans, v_rot_err, v_trans_err = validate(model, val_loader, DEVICE, args, pm_loss_fn, l1)
         
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
-                pts = batch['points'].to(DEVICE)
-                gt_R = batch['gt_rot'].to(DEVICE)
-                gt_t = batch['gt_t_residual'].to(DEVICE)
-                obj_id = batch['obj_id'].to(DEVICE)
-                sym = batch['sym_str']
-                
-                pred_rot6d, pred_t = model(pts, obj_id)
-                pred_R = utils.rotation_6d_to_matrix(pred_rot6d)
-                
-                # Rotation Error (Geodesic)
-                loss_g = utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
-                val_geo_loss += loss_g.item() * pts.shape[0]
-                
-                # Translation Error (L2 Distance in cm)
-                # pred_t and gt_t are residuals here
-                trans_dist = torch.norm(pred_t - gt_t, dim=1) * 100.0 # cm
-                val_trans_err_cm += trans_dist.sum().item()
-                
-                val_count += pts.shape[0]
+        writer.add_scalar('Val/Loss', v_loss, epoch)
+        writer.add_scalar('Val/PM_Loss', v_pm, epoch)
+        writer.add_scalar('Val/Geo_Loss', v_geo, epoch)
+        writer.add_scalar('Val/Trans_Loss', v_trans, epoch)
+        writer.add_scalar('Val/RotError', v_rot_err, epoch)
+        writer.add_scalar('Val/TransError', v_trans_err, epoch)
 
-        avg_val_rot_deg = (val_geo_loss / val_count) * (180.0 / np.pi)
-        avg_val_trans_cm = val_trans_err_cm / val_count
-        
-        print(f"Epoch {epoch+1} | Train Loss {total_loss/len(train_loader):.4f} | Val Rot Error {avg_val_rot_deg:.2f} deg | Val Trans Error {avg_val_trans_cm:.2f} cm")
+        print(f"Epoch {epoch+1} | Train Loss {t_loss:.4f} | Val Loss {v_loss:.4f} | Val Rot {v_rot_err:.2f} deg | Val Trans {v_trans_err:.2f} cm")
 
         # Save Best
-        if avg_val_rot_deg < best_val_rot:
-            best_val_rot = avg_val_rot_deg
-            torch.save(model.state_dict(), "pointnet_best.pth")
-            print("Saved best model (Val Improvement)")
+        if v_loss < best_val_loss:
+            best_val_loss = v_loss
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': opt.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_loss': best_val_loss
+            }, save_path)
+            print(f"Saved best model to {save_path}")
 
-        # --- VISUALIZATION (Full Scene) ---
-        os.makedirs("training_vis", exist_ok=True)
-        
-        # Load the scene image (just once)
+        # Visualization
+        os.makedirs(f"{args.output_dir}/training_vis", exist_ok=True)
         vis_img_path = val_dataset.rgb_files[vis_scene_idx]
         vis_img = cv2.imread(vis_img_path)
         
@@ -125,8 +217,8 @@ def train():
                 sample = val_dataset[idx]
                 pts = sample['points'].unsqueeze(0).to(DEVICE)
                 obj_id = torch.tensor([sample['obj_id']]).to(DEVICE)
-                K = sample['intrinsic'] # numpy
-                dims = sample['obj_dims'] # numpy
+                K = sample['intrinsic']
+                dims = sample['obj_dims']
                 scale = sample['scale'].numpy()
                 c = sample['centroid'].numpy()
                 
@@ -137,7 +229,7 @@ def train():
                 size = dims * scale
                 utils.draw_projected_box3d(vis_img, pred_t, size, pred_R, np.eye(4), K, color=(0, 255, 0), thickness=2)
         
-        cv2.imwrite(f"training_vis/epoch_{epoch+1}_scene.png", vis_img)
+        cv2.imwrite(f"{args.output_dir}/training_vis/epoch_{epoch+1}_scene.png", vis_img)
 
 if __name__ == "__main__":
     train()

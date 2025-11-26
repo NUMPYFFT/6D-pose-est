@@ -1,240 +1,27 @@
+import os
+import pickle
 import numpy as np
 import torch
-import torch.nn.functional as F
 import cv2
-import pandas as pd
 import torch.nn as nn
-import itertools
+from PIL import Image
+import open3d as o3d
+from tqdm import tqdm
+import pandas as pd
+from collections import Counter
+from data import PoseDataset
 
 # --- Rotation conversions ---
 def rotation_6d_to_matrix(rot_6d):
     batch_size = rot_6d.shape[0]
     a1 = rot_6d[:, :3]
     a2 = rot_6d[:, 3:]
-    b1 = nn.functional.normalize(a1, dim=1)
+    b1 = nn.functional.normalize(a1, dim=1, eps=1e-6)
     b2 = a2 - torch.sum(b1 * a2, dim=1, keepdim=True) * b1
-    b2 = nn.functional.normalize(b2, dim=1)
+    b2 = nn.functional.normalize(b2, dim=1, eps=1e-6)
     b3 = torch.cross(b1, b2, dim=1)
     rot_matrix = torch.stack([b1, b2, b3], dim=1).transpose(-2, -1)
     return rot_matrix
-
-# --- Symmetry matrix generation ---
-def get_symmetry_rotation_matrices(symmetry_type, device, num_samples=8):
-    dtype = torch.float32
-    if symmetry_type == 'symmetric_z':
-        angles = torch.linspace(0, 2 * np.pi, num_samples, device=device, dtype=dtype)
-        rotations = []
-        for angle in angles:
-            cos_a, sin_a = torch.cos(angle), torch.sin(angle)
-            rotations.append(torch.tensor([
-                [cos_a, -sin_a, 0.0],
-                [sin_a, cos_a, 0.0],
-                [0.0, 0.0, 1.0]
-            ], device=device, dtype=dtype))
-        return torch.stack(rotations)
-
-    if symmetry_type == 'symmetric_z90':
-        return torch.tensor([
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
-            [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
-            [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
-        ], device=device, dtype=dtype)
-
-    if symmetry_type == 'symmetric_x180':
-        return torch.tensor([
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]]
-        ], device=device, dtype=dtype)
-
-    return torch.eye(3, device=device).unsqueeze(0)
-
-
-
-
-def translation_distance(pred_trans, gt_trans):
-    """
-    Compute Euclidean distance between translations.
-    
-    Args:
-        pred_trans: [batch_size, 3] predicted translations
-        gt_trans: [batch_size, 3] ground truth translations
-        
-    Returns:
-        distance: [batch_size] distances in same units as input
-    """
-    return torch.norm(pred_trans - gt_trans, dim=1)
-
-
-def compute_symmetry_aware_rotation_errors(pred_rotmat, gt_rotmat, object_names, symmetry_dict, device=None):
-    """Compute minimal rotation error over object symmetries for each sample using rotation matrices."""
-    if device is None:
-        device = pred_rotmat.device
-
-    pred_rotmat = pred_rotmat.to(device)
-    gt_rotmat = gt_rotmat.to(device)
-
-    errors = []
-    batch_size = pred_rotmat.shape[0]
-    object_names = object_names or []
-
-    for i in range(batch_size):
-        # --- Pose Metrics ---
-        obj_name = object_names[i] if i < len(object_names) else None
-        symmetry_type = symmetry_dict.get(obj_name, 'asymmetric') if symmetry_dict else 'asymmetric'
-
-    gt_rot_matrix = gt_rotmat[i]  # [3, 3]
-    symmetry_rots = get_symmetry_rotation_matrices(symmetry_type, device)  # [N, 3, 3]
-    # Compute all symmetric ground truth rotations: [N, 3, 3]
-    # Each symmetric rotation: symmetry_rot @ gt_rot_matrix
-    symmetric_rotations = torch.matmul(symmetry_rots, gt_rot_matrix)  # [N, 3, 3]
-
-    pred_matrix = pred_rotmat[i].unsqueeze(0).expand_as(symmetric_rotations)  # [N, 3, 3]
-    # Compute rotation error for each symmetric equivalent
-    angular_errors = rotation_matrix_angular_distance(pred_matrix, symmetric_rotations)
-    errors.append(torch.min(angular_errors).item())
-
-    return errors
-
-
-def load_symmetry_info(csv_path='benchmark_utils/objects.csv'):
-    """Load symmetry metadata mapping object name to symmetry type."""
-    try:
-        df = pd.read_csv(csv_path)
-    except FileNotFoundError:
-        return {}
-
-    return {row['object']: row['metric'] for _, row in df.iterrows()}
-
-
-def rotation_matrix_angular_distance(pred_rotmat, gt_rotmat):
-    """
-    Compute angular distance between rotation matrices in degrees.
-    Args:
-        pred_rotmat: [batch_size, 3, 3] predicted rotation matrices
-        gt_rotmat: [batch_size, 3, 3] ground truth rotation matrices
-    Returns:
-        angular_distance: [batch_size] angular distances in degrees
-    """
-    # Compute relative rotation matrix
-    rel_rot = torch.matmul(pred_rotmat.transpose(1, 2), gt_rotmat)
-    # Compute trace
-    trace = rel_rot[:, 0, 0] + rel_rot[:, 1, 1] + rel_rot[:, 2, 2]
-    # Clamp trace for numerical stability
-    trace = torch.clamp((trace - 1) / 2, -1.0, 1.0)
-    angular_distance_rad = torch.acos(trace)
-    angular_distance_deg = angular_distance_rad * 180.0 / np.pi
-    return angular_distance_deg
-
-def pose_loss(pred_rotmat, pred_translation, gt_rotmat, gt_translation, 
-              rotation_weight=1.0, translation_weight=1.0):
-    """
-    Combined pose loss function using rotation matrices.
-    Args:
-        pred_rotmat: [batch_size, 3, 3] predicted rotation matrices
-        pred_translation: [batch_size, 3] predicted translations
-        gt_rotmat: [batch_size, 3, 3] ground truth rotation matrices
-        gt_translation: [batch_size, 3] ground truth translations
-        rotation_weight: Weight for rotation loss
-        translation_weight: Weight for translation loss
-    Returns:
-        loss: Combined pose loss
-        metrics: Dictionary with individual losses and errors
-    """
-    # Rotation loss using angular distance
-    rotation_loss = rotation_matrix_angular_distance(pred_rotmat, gt_rotmat).mean()
-    # Translation loss using L2 distance
-    translation_loss = F.mse_loss(pred_translation, gt_translation)
-    # Combined loss
-    total_loss = rotation_weight * rotation_loss + translation_weight * translation_loss
-    # Compute metrics for monitoring
-    with torch.no_grad():
-        rotation_error = rotation_matrix_angular_distance(pred_rotmat, gt_rotmat)
-        translation_error = translation_distance(pred_translation, gt_translation)
-        metrics = {
-            'rotation_loss': rotation_loss.item(),
-            'translation_loss': translation_loss.item(),
-            'rotation_error_deg': rotation_error.mean().item(),
-            'translation_error_m': translation_error.mean().item(),
-            'rotation_error_max': rotation_error.max().item(),
-            'translation_error_max': translation_error.max().item()
-        }
-        # --- Point Cloud and Visualization Utilities ---
-    return total_loss, metrics
-
-
-def rotation_geodesic_loss(pred_R, gt_R):
-    """
-    pred_R, gt_R: (B, 3, 3)
-    Returns angle error in radians: (B,)
-    """
-    # R_rel = R_pred^T * R_gt
-    R_rel = torch.bmm(pred_R.transpose(1, 2), gt_R)
-
-    # trace(R_rel)
-    trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
-
-    # Avoid numerical issues
-    cos_theta = (trace - 1) / 2
-    cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
-
-    # angle in radians
-    theta = torch.acos(cos_theta)
-    return theta
-
-
-def compute_pose_metrics(pred_rotmat, pred_translation, gt_rotmat, gt_translation,
-                         object_names=None, symmetry_dict=None):
-    """
-    Compute comprehensive pose estimation metrics using rotation matrices.
-    Returns:
-        metrics: Dictionary with rotation and translation errors
-    """
-    with torch.no_grad():
-        if symmetry_dict and object_names is not None:
-            rotation_error_list = compute_symmetry_aware_rotation_errors(
-                pred_rotmat, gt_rotmat, object_names, symmetry_dict, pred_rotmat.device
-            )
-            rotation_errors = torch.tensor(rotation_error_list, device=pred_rotmat.device)
-        else:
-            rotation_errors = rotation_matrix_angular_distance(pred_rotmat, gt_rotmat)
-        # Translation errors in meters (assuming input is in meters)
-        translation_errors = translation_distance(pred_translation, gt_translation)
-        metrics = {
-            'rotation_mean': rotation_errors.mean().item(),
-            'rotation_median': rotation_errors.median().item(),
-            'rotation_std': rotation_errors.std().item() if rotation_errors.numel() > 1 else 0.0,
-            'rotation_max': rotation_errors.max().item(),
-            'translation_mean': translation_errors.mean().item(),
-            'translation_median': translation_errors.median().item(),
-            'translation_std': translation_errors.std().item() if translation_errors.numel() > 1 else 0.0,
-            'translation_max': translation_errors.max().item(),
-            # Success rates (professor's requirements)
-            'rotation_success_4deg': (rotation_errors <= 4.0).float().mean().item(),
-            'translation_success_1cm': (translation_errors <= 0.01).float().mean().item(),
-            'combined_success': ((rotation_errors <= 4.0) & (translation_errors <= 0.01)).float().mean().item()
-        }
-    return metrics
-
-
-def apply_pose_to_points(points, rotation_matrix, translation):
-    """
-    Apply pose transformation to point cloud using rotation matrices.
-    Args:
-        points: [batch_size, 3, num_points] point clouds
-        rotation_matrix: [batch_size, 3, 3] rotation matrices
-        translation: [batch_size, 3] translations
-    Returns:
-        transformed_points: [batch_size, 3, num_points] transformed point clouds
-    """
-    batch_size, _, num_points = points.shape
-    # Apply rotation: R @ points
-    rotated_points = torch.bmm(rotation_matrix, points)  # [batch_size, 3, num_points]
-    # Apply translation
-    translation_expanded = translation.unsqueeze(2).expand(-1, -1, num_points)
-    transformed_points = rotated_points + translation_expanded
-    return transformed_points
-
 
 def draw_projected_box3d(image, center, size, rotation, extrinsic, intrinsic, thickness=2, color=None):
     """
@@ -308,394 +95,183 @@ def draw_projected_box3d(image, center, size, rotation, extrinsic, intrinsic, th
             -w_img < pt2[0] < 2*w_img and -h_img < pt2[1] < 2*h_img):
             cv2.line(image, pt1, pt2, color, thickness)
 
-
-def project_3d_to_2d(points_3d, intrinsics):
-    """
-    Project 3D points to 2D image coordinates.
+def preprocess_dataset(split, args):
+    print(f"Processing split: {split}")
+    # Initialize dataset to get the valid index list
+    # We use num_points=4096 to ensure we get enough points
+    dataset = PoseDataset(split, args.training_data_dir, args.split_dir, num_points=4096)
     
-    Args:
-        points_3d: [N, 3] 3D points in camera coordinates
-        intrinsics: [3, 3] camera intrinsic matrix
+    save_dir = os.path.join(args.training_data_dir, "preprocessed", split)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"Saving to {save_dir}...")
+    
+    for i, (scene_idx, obj_id) in enumerate(tqdm(dataset.samples)):
+        # Re-implementing the loading logic to avoid augmentation and ensure consistency
         
-    Returns:
-        points_2d: [N, 2] 2D image coordinates
-    """
-    # Convert to homogeneous coordinates
-    ones = np.ones((points_3d.shape[0], 1))
-    points_3d_homogeneous = np.hstack([points_3d, ones])
-    
-    # Project to 2D
-    points_2d_homogeneous = intrinsics @ points_3d.T
-    
-    # Convert from homogeneous to cartesian
-    points_2d = points_2d_homogeneous[:2, :].T / points_2d_homogeneous[2, :].T[:, np.newaxis]
-    
-    return points_2d
-
-
-def get_3d_bbox_corners(size, pose_rotation, pose_translation):
-    """
-    Get 3D bounding box corners from size and pose.
-    Args:
-        size: [3] box dimensions [width, height, depth]
-        pose_rotation: [6] 6D rotation representation
-        pose_translation: [3] translation vector
-    Returns:
-        corners: [8, 3] 3D box corners in world coordinates
-    """
-    # Define box corners in object coordinate system (centered at origin)
-    w, h, d = size[0]/2, size[1]/2, size[2]/2
-    corners_obj = np.array([
-        [-w, -h, -d],  # 0
-        [ w, -h, -d],  # 1
-        [ w,  h, -d],  # 2
-        [-w,  h, -d],  # 3
-        [-w, -h,  d],  # 4
-        [ w, -h,  d],  # 5
-        [ w,  h,  d],  # 6
-        [-w,  h,  d],  # 7
-    ])
-    # Convert 6D rotation to rotation matrix
-    rotation_matrix = rotation_6d_to_matrix(torch.tensor(pose_rotation).unsqueeze(0)).squeeze(0).cpu().numpy()
-    # Transform corners to world coordinates
-    corners_world = (rotation_matrix @ corners_obj.T).T + pose_translation
-    return corners_world
-
-def draw_axes(image, center, rotation, extrinsic, intrinsic, length=0.1, thickness=2):
-    """
-    Draw 3D coordinate axes on an image.
-    Args:
-        image: Input image (numpy array) - modified in place
-        center: [3] 3D center position in world coordinates
-        rotation: [3, 3] rotation matrix (object to world)
-        extrinsic: [4, 4] camera extrinsic matrix (world to camera)
-        intrinsic: [3, 3] camera intrinsic matrix
-        length: Length of the axes in meters
-        thickness: Line thickness
-    """
-    # Define axes in object coordinates
-    # X: Red, Y: Green, Z: Blue
-    axes_obj = np.array([
-        [0.0, 0.0, 0.0], # Origin
-        [length, 0.0, 0.0], # X
-        [0.0, length, 0.0], # Y
-        [0.0, 0.0, length]  # Z
-    ])
-    
-    # Transform to world coordinates
-    axes_world = (rotation @ axes_obj.T).T + center
-    
-    # Add homogeneous coordinate
-    axes_world_hom = np.hstack([axes_world, np.ones((4, 1))])
-    
-    # Transform to camera coordinates
-    axes_cam_hom = (extrinsic @ axes_world_hom.T).T
-    axes_cam = axes_cam_hom[:, :3]
-    
-    # Project to 2D
-    axes_2d_hom = (intrinsic @ axes_cam.T).T
-    axes_2d = axes_2d_hom[:, :2] / axes_2d_hom[:, 2:3]
-    axes_2d = axes_2d.astype(int)
-    
-    origin = tuple(axes_2d[0])
-    pt_x = tuple(axes_2d[1])
-    pt_y = tuple(axes_2d[2])
-    pt_z = tuple(axes_2d[3])
-    
-    h_img, w_img = image.shape[:2]
-    
-    def is_valid(pt):
-        return -w_img < pt[0] < 2*w_img and -h_img < pt[1] < 2*h_img
-
-    if axes_cam[0, 2] > 0: # Origin in front of camera
-        if is_valid(origin) and is_valid(pt_x):
-            cv2.line(image, origin, pt_x, (0, 0, 255), thickness) # X - Red (BGR)
-        if is_valid(origin) and is_valid(pt_y):
-            cv2.line(image, origin, pt_y, (0, 255, 0), thickness) # Y - Green
-        if is_valid(origin) and is_valid(pt_z):
-            cv2.line(image, origin, pt_z, (255, 0, 0), thickness) # Z - Blue
-
-# --- Symmetry Utils ---
-def get_rotation_matrix(axis, angle):
-    axis = np.asarray(axis)
-    axis = axis / np.linalg.norm(axis)
-    cos_angle, sin_angle = np.cos(angle), np.sin(angle)
-    cross_prod_mat = np.cross(np.eye(3), axis)
-    R = cos_angle * np.eye(3) + sin_angle * cross_prod_mat + (1.0 - cos_angle) * np.outer(axis, axis)
-    return R
-
-def get_symmetry_rotations(sym_axes, sym_orders):
-    sym_rots_per_axis = []
-    rot_axis = None
-    for sym_axis, sym_order in zip(sym_axes, sym_orders):
-        if sym_order is None:
-            sym_rots_per_axis.append([np.eye(3)])
-        elif np.isinf(sym_order):
-            if rot_axis is None:
-                rot_axis = sym_axis
-            # Discretize continuous symmetry (e.g. 36 steps = 10 degrees)
-            Rs = []
-            for i in range(36):
-                angle = i * (2 * np.pi / 36)
-                R = get_rotation_matrix(sym_axis, angle)
-                Rs.append(R)
-            sym_rots_per_axis.append(Rs)
-        else:
-            Rs = []
-            for i in range(sym_order):
-                angle = i * (2 * np.pi / sym_order)
-                R = get_rotation_matrix(sym_axis, angle)
-                Rs.append(R)
-            sym_rots_per_axis.append(Rs)
+        # Load images
+        depth = np.asarray(Image.open(dataset.depth_files[scene_idx]), dtype=np.float32) / 1000.0
+        rgb = np.asarray(Image.open(dataset.rgb_files[scene_idx]), dtype=np.float32) / 255.0
+        label = np.asarray(Image.open(dataset.label_files[scene_idx]), dtype=np.int32)
+        
+        with open(dataset.meta_files[scene_idx], "rb") as f:
+            meta = pickle.load(f)
             
-    sym_rots = []
-    for Rs in itertools.product(*sym_rots_per_axis):
-        R_tmp = np.eye(3)
-        for R in Rs:
-            R_tmp = R_tmp @ R
-        sym_rots.append(R_tmp)
-    return np.array(sym_rots), rot_axis
-
-def parse_geometric_symmetry(sym_str):
-    sym_axes = []
-    sym_orders = []
-    if pd.isna(sym_str) or str(sym_str).lower() == 'no' or str(sym_str).lower() == 'nan':
-        return [np.array([0, 0, 0])], [None]
-    
-    parts = str(sym_str).split('|')
-    for part in parts:
-        part = part.strip().lower()
-        if not part: continue
-        
-        if 'inf' in part:
-            order = np.inf
-            axis_char = part[0]
+        intr = meta['intrinsic']
+        if isinstance(intr, dict):
+            K = np.array([[intr['fx'], 0, intr['cx']], [0, intr['fy'], intr['cy']], [0, 0, 1]], dtype=np.float32)
         else:
-            try:
-                digits = "".join([c for c in part if c.isdigit()])
-                order = int(digits) if digits else 1
-                axis_char = part[0]
-            except:
-                continue
+            K = np.array(intr, dtype=np.float32)
+            
+        mask = (label == obj_id)
+        vs, us = np.where(mask)
         
-        if axis_char == 'x':
-            axis = np.array([1.0, 0.0, 0.0])
-        elif axis_char == 'y':
-            axis = np.array([0.0, 1.0, 0.0])
-        elif axis_char == 'z':
-            axis = np.array([0.0, 0.0, 1.0])
+        z = depth[vs, us]
+        valid = (z > 0.001) & (z < 3.0)
+        z = z[valid]
+        vs = vs[valid]
+        us = us[valid]
+        
+        if len(z) == 0:
+            continue # Should not happen due to indexing
+            
+        x = (us - K[0,2]) * z / K[0,0]
+        y = (vs - K[1,2]) * z / K[1,1]
+        pts = np.stack([x, y, z], axis=-1)
+        colors = rgb[vs, us]
+        
+        # Downsample & Normals (The expensive part)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        pcd = pcd.voxel_down_sample(0.005)
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.015, max_nn=30))
+        pcd.orient_normals_towards_camera_location(camera_location=np.array([0., 0., 0.]))
+        
+        pts = np.asarray(pcd.points)
+        colors = np.asarray(pcd.colors)
+        normals = np.asarray(pcd.normals)
+        
+        # Sample to 4096 (or less if not enough)
+        # We save UP TO 4096 points.
+        N = len(pts)
+        if N >= 4096:
+            idxs = np.random.choice(N, 4096, replace=False)
         else:
-            continue
+            idxs = np.random.choice(N, 4096, replace=True)
             
-        sym_axes.append(axis)
-        sym_orders.append(order)
+        pts = pts[idxs]
+        colors = colors[idxs]
+        normals = normals[idxs]
         
-    if not sym_axes:
-        return [np.array([0, 0, 0])], [None]
+        # Centroid
+        centroid = np.mean(pts, axis=0)
+        pts = pts - centroid # Center the points
         
-    return sym_axes, sym_orders
-
-def compute_symmetry_aware_loss(R_pred, R_gt, sym_str):
-    sym_axes, sym_orders = parse_geometric_symmetry(sym_str)
-    sym_rots, rot_axis = get_symmetry_rotations(sym_axes, sym_orders)
-    
-    losses = []
-    
-    # If infinite symmetry (e.g. cylinder)
-    if rot_axis is not None:
-        for R_sym in sym_rots:
-            R_gt_sym = R_gt @ R_sym
-            # Axis alignment error
-            axis_pred = R_pred @ rot_axis
-            axis_gt = R_gt_sym @ rot_axis
-            dot = np.clip(np.dot(axis_pred, axis_gt), -1.0, 1.0)
-            angle = np.arccos(dot)
-            losses.append(np.degrees(angle))
-    else:
-        # Discrete symmetry
-        for R_sym in sym_rots:
-            R_gt_sym = R_gt @ R_sym
-            # Rotation error
-            trace = np.trace(R_pred.T @ R_gt_sym)
-            angle = np.arccos(np.clip(0.5 * (trace - 1), -1.0, 1.0))
-            losses.append(np.degrees(angle))
-            
-    return min(losses) if losses else 0.0
-
-# --- Loss Functions ---
-def chamfer_distance(p1, p2):
-    """
-    Compute Chamfer Distance between two point clouds.
-    p1: (B, N, 3)
-    p2: (B, M, 3)
-    Returns: (B,)
-    """
-    dists = torch.cdist(p1, p2) # (B, N, M)
-    
-    min_dist1, _ = torch.min(dists, dim=2) # (B, N) - dist from p1 to closest in p2
-    min_dist2, _ = torch.min(dists, dim=1) # (B, M) - dist from p2 to closest in p1
-    
-    return torch.mean(min_dist1, dim=1) + torch.mean(min_dist2, dim=1)
-
-def point_matching_loss(pred_R, pred_t, gt_R, gt_t, points, sym_strs):
-    """
-    pred_R: (B, 3, 3)
-    pred_t: (B, 3)
-    gt_R:   (B, 3, 3)
-    gt_t:   (B, 3)
-    points: (B, N, 3)
-    sym_strs: list of strings
-    """
-    B, N, _ = points.shape
-
-    # Transform predicted & gt point clouds
-    pred_pts = torch.bmm(points, pred_R.transpose(1, 2)) + pred_t.unsqueeze(1)
-    gt_pts   = torch.bmm(points, gt_R.transpose(1, 2))   + gt_t.unsqueeze(1)
-
-    final_losses = []
-
-    for i in range(B):
-        s = sym_strs[i]
-
-        # ----- SYMMETRIC OBJECT (ADD-S) -----
-        if ('2' in s) or ('4' in s) or ('inf' in s):
-            idx = torch.randperm(N)[:512]
-            p_sub = pred_pts[i:i+1, idx, :]
-            g_sub = gt_pts[i:i+1, idx, :]
-
-            # Chamfer
-            d = torch.cdist(p_sub, g_sub)       # (1,512,512)
-            d1 = d.min(dim=2)[0].mean()
-            d2 = d.min(dim=1)[0].mean()
-            loss = 0.5 * (d1 + d2)
-
-        # ----- NON-SYMMETRIC (ADD) -----
+        # GT Pose
+        T_wc = np.array(meta['extrinsic']).reshape(4,4)
+        T_ow = np.array(meta['poses_world'][obj_id]).reshape(4,4)
+        T_co = T_wc @ T_ow
+        
+        gt_R = T_co[:3,:3]
+        gt_t = T_co[:3,3]
+        gt_t_residual = gt_t - centroid
+        
+        # Object Info
+        if obj_id in meta['object_ids']:
+            idx2 = list(meta['object_ids']).index(obj_id)
+            name = meta['object_names'][idx2]
         else:
-            loss = torch.norm(pred_pts[i] - gt_pts[i], dim=1).mean()
-
-        # ensure shape = (1,)
-        final_losses.append(loss.unsqueeze(0))
-
-    return torch.cat(final_losses).mean()
-
-def get_symmetry_matrices_torch(sym_str, device):
-    """
-    Generates a batch of symmetry rotation matrices from a symmetry string (e.g., 'z2|x2').
-    Returns: (K, 3, 3) tensor
-    """
-    if not sym_str or sym_str == 'no' or sym_str == 'asymmetric' or 'nan' in sym_str:
-        return torch.eye(3, device=device).unsqueeze(0)
-
-    # Base set of rotations (Identity)
-    rotations = [torch.eye(3, device=device)]
-
-    parts = sym_str.split('|')
-    for part in parts:
-        part = part.strip().lower()
-        if not part: continue
-
-        # Parse Axis
-        if part.startswith('x'): axis = torch.tensor([1., 0., 0.], device=device)
-        elif part.startswith('y'): axis = torch.tensor([0., 1., 0.], device=device)
-        elif part.startswith('z'): axis = torch.tensor([0., 0., 1.], device=device)
-        else: continue
-
-        # Parse Order
-        if 'inf' in part:
-            # For infinite symmetry, we cannot enumerate all. 
-            # We return current set (this function is for discrete mainly).
-            # Handling inf in loss requires separate logic (axis projection).
-            continue
+            name = "unknown"
+            
+        if name in dataset.obj_info_cache:
+            info = dataset.obj_info_cache[name]
+            sym = info['geometric_symmetry']
+            dims = np.array([info['width'], info['length'], info['height']], dtype=np.float32)
         else:
-            try:
-                digits = "".join([c for c in part if c.isdigit()])
-                order = int(digits) if digits else 1
-            except:
-                continue
-
-        # Generate new rotations for this axis
-        new_rots = []
-        for k in range(1, order):
-            angle = 2 * np.pi * k / order
+            sym = "no"
+            dims = np.zeros(3, dtype=np.float32)
             
-            # Rodrigues formula for rotation matrix
-            K = torch.tensor([
-                [0., -axis[2], axis[1]],
-                [axis[2], 0., -axis[0]],
-                [-axis[1], axis[0], 0.]
-            ], device=device)
+        scale = meta['scales'][obj_id]
+        if scale is None: scale = np.array([1,1,1], dtype=np.float32)
+        else: scale = np.array(scale, dtype=np.float32)
+        if scale.ndim == 0: scale = np.array([scale, scale, scale], dtype=np.float32)
+
+        # Save
+        np.savez_compressed(
+            os.path.join(save_dir, f"{i:06d}.npz"),
+            points=pts.astype(np.float32),
+            colors=colors.astype(np.float32),
+            normals=normals.astype(np.float32),
+            gt_R=gt_R.astype(np.float32),
+            gt_t_residual=gt_t_residual.astype(np.float32),
+            centroid=centroid.astype(np.float32),
+            obj_id=obj_id,
+            sym=str(sym),
+            dims=dims,
+            scale=scale,
+            K=K,
+            rgb_path=dataset.rgb_files[scene_idx] # For visualization if needed
+        )
+
+def check_class_distribution(args):
+    print(f"Checking class distribution for split: train")
+    print(f"Data Dir: {args.training_data_dir}")
+    print(f"Split Dir: {args.split_dir}")
+
+    # Initialize Dataset (this will load/create the index)
+    # We use a small num_points just to init, we won't load actual point clouds
+    dataset = PoseDataset("train", args.training_data_dir, args.split_dir, num_points=1024)
+    
+    # Access the internal samples list: [(scene_idx, obj_id), ...]
+    samples = dataset.samples
+    
+    print(f"Total samples: {len(samples)}")
+    
+    # Count object IDs
+    obj_counts = Counter([s[1] for s in samples])
+    
+    # Load Object Names for better readability
+    # objects_df = pd.read_csv(args.objects_csv)
+    
+    # Let's iterate and collect names
+    id_to_name = {}
+    
+    print("Resolving object names...")
+    
+    # Optimization: We only need to find one instance of each ID to get its name.
+    found_ids = set()
+    for i in range(len(dataset.meta_files)):
+        if len(found_ids) == len(obj_counts):
+            break
             
-            # Fix: Ensure angle is on correct device for sin/cos
-            angle_t = torch.tensor(angle, device=device)
-            R = torch.eye(3, device=device) + torch.sin(angle_t) * K + (1 - torch.cos(angle_t)) * (K @ K)
-            new_rots.append(R)
+        with open(dataset.meta_files[i], "rb") as f:
+            meta = pickle.load(f)
+            
+        for idx, oid in enumerate(meta['object_ids']):
+            if oid not in id_to_name:
+                id_to_name[oid] = meta['object_names'][idx]
+                found_ids.add(oid)
 
-        # Combine with existing rotations (Cartesian product)
-        current_rots = list(rotations)
-        for r_new in new_rots:
-            for r_curr in current_rots:
-                rotations.append(r_curr @ r_new)
-
-    return torch.stack(rotations)
-
-def symmetry_aware_geodesic_loss(pred_R, gt_R, sym_strs):
-    """
-    Computes the minimum geodesic loss over all valid symmetric poses.
-    pred_R: (B, 3, 3)
-    gt_R: (B, 3, 3)
-    sym_strs: list of strings
-    """
-    losses = []
-    batch_size = pred_R.shape[0]
-    device = pred_R.device
-
-    for i in range(batch_size):
-        s = sym_strs[i]
+    # Print Distribution
+    print("\n" + "="*60)
+    print(f"{'ID':<5} | {'Object Name':<30} | {'Count':<10} | {'%':<5}")
+    print("-" * 60)
+    
+    sorted_counts = obj_counts.most_common()
+    
+    for oid, count in sorted_counts:
+        name = id_to_name.get(oid, "Unknown")
+        percentage = (count / len(samples)) * 100
+        print(f"{oid:<5} | {name:<30} | {count:<10} | {percentage:.2f}%")
         
-        # If infinite symmetry, we fall back to standard geodesic (or 0 if we want to ignore).
-        # Ideally we should project, but for now let's trust PM loss for infinite objects
-        # and only fix discrete ones (like lego/boxes) which cause high errors.
-        if 'inf' in s:
-            # For infinite symmetry (bottles, cans), we only care about the axis alignment.
-            # Parse axis (default to z if not specified, but usually it is 'zinf' or similar)
-            axis = torch.tensor([0., 0., 1.], device=device)
-            if 'x' in s: axis = torch.tensor([1., 0., 0.], device=device)
-            elif 'y' in s: axis = torch.tensor([0., 1., 0.], device=device)
-             
-            # Project axis: v_pred = R_pred @ axis
-            v_pred = torch.matmul(pred_R[i], axis)
-            v_gt = torch.matmul(gt_R[i], axis)
-             
-            # Angle between axes
-            dot = torch.dot(v_pred, v_gt)
-            dot = torch.clamp(dot, -1.0 + 1e-6, 1.0 - 1e-6)
-            theta = torch.acos(dot)
-            losses.append(theta)
-            continue
-
-        sym_mats = get_symmetry_matrices_torch(s, device) # (K, 3, 3)
-        
-        # Expand GT to all symmetric versions
-        # gt_R[i]: (3,3)
-        # sym_mats: (K, 3, 3)
-        # targets: (K, 3, 3) -> gt_R @ sym_mat
-        targets = torch.matmul(gt_R[i].unsqueeze(0), sym_mats) 
-        
-        # Compute geodesic loss to ALL targets
-        # pred_R[i]: (3,3)
-        pred = pred_R[i].unsqueeze(0).expand(len(targets), 3, 3)
-        
-        # R_diff = pred^T @ target
-        R_diff = torch.bmm(pred.transpose(1, 2), targets)
-        trace = R_diff[:, 0, 0] + R_diff[:, 1, 1] + R_diff[:, 2, 2]
-        cos_theta = (trace - 1) / 2
-        
-        # Fix: Clamp strictly within (-1, 1) to avoid acos gradient explosion
-        cos_theta = torch.clamp(cos_theta, -1.0 + 1e-6, 1.0 - 1e-6)
-        theta = torch.acos(cos_theta) # (K,)
-        
-        min_loss = torch.min(theta)
-        losses.append(min_loss)
-
-    return torch.stack(losses).mean()
+    print("="*60)
+    
+    # Statistics
+    counts = list(obj_counts.values())
+    print(f"\nStatistics:")
+    print(f"Min samples: {min(counts)} (ID: {sorted_counts[-1][0]} - {id_to_name.get(sorted_counts[-1][0], 'Unknown')})")
+    print(f"Max samples: {max(counts)} (ID: {sorted_counts[0][0]} - {id_to_name.get(sorted_counts[0][0], 'Unknown')})")
+    print(f"Mean samples: {sum(counts) / len(counts):.2f}")
+    print(f"Median samples: {sorted(counts)[len(counts)//2]}")
 
