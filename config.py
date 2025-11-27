@@ -23,14 +23,16 @@ def get_config(args=None):
 
     # Evaluation / ICP
     parser.add_argument("--no_icp", action="store_true", help="Disable ICP refinement")
-    parser.add_argument("--icp_stages", type=int, default=2, help="Number of ICP stages")
-    parser.add_argument("--icp_threshold", type=float, default=0.02, help="Coarse ICP threshold")
-    parser.add_argument("--max_rot_change", type=float, default=15.0, help="Max allowed rotation change in degrees")
+    parser.add_argument("--icp_stages", type=int, default=3, help="Number of ICP stages")
+    parser.add_argument("--icp_threshold", type=float, default=0.01, help="Coarse ICP threshold")
+    parser.add_argument("--max_rot_change", type=float, default=10.0, help="Max allowed rotation change in degrees")
+    parser.add_argument("--min_valid_points", type=int, default=50, help="Minimum number of valid points required to evaluate an object")
+    parser.add_argument("--split", type=str, default="val", help="Split to evaluate on (val or test)")
 
     # Paths
     parser.add_argument("--training_data_dir", type=str, default="./training_data_filtered/training_data/v2.2", help="Path to training data")
     parser.add_argument("--split_dir", type=str, default="./training_data_filtered/training_data/splits/v2", help="Path to split files")
-    parser.add_argument("--objects_csv", type=str, default="benchmark_utils/objects_v1.csv", help="Path to objects CSV")
+    parser.add_argument("--objects_csv", type=str, default="models/objects_v1.csv", help="Path to objects CSV")
     parser.add_argument("--checkpoint_path", type=str, default="pointnet_v2.pth", help="Path to save checkpoint")
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to load checkpoint from (if different from save path)")
     parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")

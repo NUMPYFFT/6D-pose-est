@@ -94,17 +94,13 @@ def refine_icp(pred_R, pred_t, source_pcd, target_pcd, max_iter=50, stages=3, co
             o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter)
         )
         
-        # Reject if fitness is too low (less than 10% overlap)
-        if reg_p2l_coarse.fitness < 0.1:
-            return pred_R, pred_t
-
         if reg_p2l_coarse.fitness > 0:
             current_pose = reg_p2l_coarse.transformation
 
+        # Stage 2: Fine alignment (1cm threshold) - Point-to-Plane
         if stages >= 2:
-            # Stage 2: Fine alignment (1cm threshold) - Point-to-Plane
             reg_p2l_fine = o3d.pipelines.registration.registration_icp(
-                source_pcd, target_pcd, 0.01, current_pose,
+                source_pcd, target_pcd, coarse_threshold * 0.5, current_pose,
                 o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                 o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30)
             )
@@ -112,40 +108,61 @@ def refine_icp(pred_R, pred_t, source_pcd, target_pcd, max_iter=50, stages=3, co
             if reg_p2l_fine.fitness > 0:
                 current_pose = reg_p2l_fine.transformation
 
+        # Stage 3: Fine alignment (0.5cm threshold) - Point-to-Point (Fix sliding)
         if stages >= 3:
-            # Stage 3: Fine alignment (1cm threshold) - Point-to-Point (Fix sliding)
-            # NOTE: Point-to-Point is often worse for depth data than Point-to-Plane.
-            # Only use if you are sure.
             reg_p2p = o3d.pipelines.registration.registration_icp(
-                source_pcd, target_pcd, 0.01, current_pose,
+                source_pcd, target_pcd, coarse_threshold * 0.25, current_pose,
                 o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30)
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20)
             )
             
-            # Only accept if fitness improves significantly
-            if reg_p2p.fitness > reg_p2l_fine.fitness + 0.05:
-                current_pose = reg_p2p.transformation
+            # Accept if RMSE improved or Fitness improved
+            # We prioritize RMSE for Point-to-Point as it tightens the fit
+            if reg_p2p.fitness > 0:
+                 current_pose = reg_p2p.transformation
 
         # -------------------------------------------------------
-        # SAFETY CHECK: Rotation Deviation
+        # SAFETY CHECK: Rotation & Translation Deviation
         # -------------------------------------------------------
-        # Calculate how much ICP changed the rotation
         R_final = current_pose[:3, :3]
-        R_diff = R_final @ pred_R.T  # Relative rotation
+        t_final = current_pose[:3, 3]
+        
+        # Rotation Diff
+        R_diff = R_final @ pred_R.T
         trace = np.trace(R_diff)
         cos_theta = (trace - 1) / 2.0
         cos_theta = np.clip(cos_theta, -1.0, 1.0)
         angle_diff = np.degrees(np.arccos(cos_theta))
 
+        # Translation Diff
+        trans_diff = np.linalg.norm(t_final - pred_t)
+
         if angle_diff > max_rot_change:
-            # print(f"[ICP REJECT] Rotation change {angle_diff:.2f} > {max_rot_change} deg. Reverting.")
-            return pred_R, pred_t
+            # print(f"[ICP REJECT] Rotation change {angle_diff:.2f} > {max_rot_change} deg.")
+            return pred_R, pred_t, 0.0, 0.0
+            
+        if trans_diff > 0.01: # TIGHTENED: Max 1cm shift allowed (was 3cm)
+            # print(f"[ICP REJECT] Translation change {trans_diff*100:.2f} > 1.0 cm.")
+            return pred_R, pred_t, 0.0, 0.0
 
     except Exception as e:
         print(f"[ICP FAIL] {e}")
-        return pred_R, pred_t
+        return pred_R, pred_t, 0.0, 0.0
 
-    return current_pose[:3, :3], current_pose[:3, 3]
+    # Get final metrics from the last successful registration
+    final_fitness = 0.0
+    final_rmse = 0.0
+    if stages >= 3 and 'reg_p2p' in locals():
+        final_fitness = reg_p2p.fitness
+        final_rmse = reg_p2p.inlier_rmse
+    elif stages >= 2 and 'reg_p2l_fine' in locals():
+        final_fitness = reg_p2l_fine.fitness
+        final_rmse = reg_p2l_fine.inlier_rmse
+    elif 'reg_p2l_coarse' in locals():
+        final_fitness = reg_p2l_coarse.fitness
+        final_rmse = reg_p2l_coarse.inlier_rmse
+
+    return current_pose[:3, :3], current_pose[:3, 3], final_fitness, final_rmse
 
 # -------------------------------------------------------------------------
 # Worker function for Parallel ICP
@@ -169,7 +186,7 @@ def process_icp_sample(data):
     source_pcd = load_canonical_model_from_csv(obj_name, objects_df, scale)
     
     if source_pcd is None:
-        return pred_R, pred_t
+        return pred_R, pred_t, 0.0, 0.0
 
     # Build target PCD
     target_pcd = o3d.geometry.PointCloud()
@@ -179,15 +196,15 @@ def process_icp_sample(data):
     target_pcd.orient_normals_towards_camera_location(np.array([0.,0.,0.]))
     
     if len(target_pcd.points) <= 30:
-        return pred_R, pred_t
+        return pred_R, pred_t, 0.0, 0.0
 
     # Run ICP
-    refined_R, refined_t = refine_icp(pred_R, pred_t, source_pcd, target_pcd, 
+    refined_R, refined_t, fitness, rmse = refine_icp(pred_R, pred_t, source_pcd, target_pcd, 
                                       stages=icp_stages, 
                                       coarse_threshold=icp_threshold, 
                                       max_rot_change=max_rot_change)
     
-    return refined_R, refined_t
+    return refined_R, refined_t, fitness, rmse
 
 
 # -------------------------------------------------------------------------
@@ -217,7 +234,7 @@ def evaluate():
     # -------------------------------
     # Load dataset and model
     # -------------------------------
-    val_dataset = PoseDataset("val", args.training_data_dir, args.split_dir, num_points=args.num_points)
+    val_dataset = PoseDataset(args.split, args.training_data_dir, args.split_dir, num_points=args.num_points)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers)
 
     print("Loading PointNet...")
@@ -269,8 +286,8 @@ def evaluate():
         K = batch["intrinsic"].numpy()[0]
         valid_points = batch["valid_points"].item()
 
-        # Skip if too few valid points (e.g. < 50)
-        if valid_points < 50:
+        # Skip if too few valid points
+        if valid_points < args.min_valid_points:
             continue
 
         # Predict pose
@@ -343,11 +360,20 @@ def evaluate():
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(samples_to_process), desc="ICP Refinement"):
                 i = futures[future]
                 try:
-                    refined_R, refined_t = future.result()
+                    refined_R, refined_t, fitness, rmse = future.result()
                     samples_to_process[i]['pred_R'] = refined_R
                     samples_to_process[i]['pred_t'] = refined_t
+                    samples_to_process[i]['icp_fitness'] = fitness
+                    samples_to_process[i]['icp_rmse'] = rmse
                 except Exception as e:
                     print(f"ICP Worker failed for sample {i}: {e}")
+                    samples_to_process[i]['icp_fitness'] = 0.0
+                    samples_to_process[i]['icp_rmse'] = 0.0
+    else:
+        # Initialize default values if ICP is off
+        for s in samples_to_process:
+            s['icp_fitness'] = 0.0
+            s['icp_rmse'] = 0.0
     
     # ============================================================
     # Phase 3: Metrics & Visualization
@@ -379,20 +405,31 @@ def evaluate():
         K = s['K']
         
         # Metrics
-        rot_err = loss_utils.compute_symmetry_aware_loss(pred_R, gt_R, sym)
-        trans_err = np.linalg.norm(pred_t - gt_t) * 100
-
-        total_rot += rot_err
-        total_trans += trans_err
-        total_count += 1
-        if rot_err < 5.0 and trans_err < 1.0:
-            pass_count += 1
+        if args.split == 'test':
+            rot_err = 0.0
+            trans_err = 0.0
             
-        # Per-object metrics
-        if obj_id not in object_metrics:
-            object_metrics[obj_id] = {'rot': [], 'trans': [], 'name': s['obj_name']}
-        object_metrics[obj_id]['rot'].append(rot_err)
-        object_metrics[obj_id]['trans'].append(trans_err)
+            # Per-object metrics (ICP Fitness/RMSE)
+            if obj_id not in object_metrics:
+                object_metrics[obj_id] = {'fitness': [], 'rmse': [], 'name': s['obj_name']}
+            object_metrics[obj_id]['fitness'].append(s['icp_fitness'])
+            object_metrics[obj_id]['rmse'].append(s['icp_rmse'])
+            
+        else:
+            rot_err = loss_utils.compute_symmetry_aware_loss(pred_R, gt_R, sym)
+            trans_err = np.linalg.norm(pred_t - gt_t) * 100
+
+            total_rot += rot_err
+            total_trans += trans_err
+            total_count += 1
+            if rot_err < 5.0 and trans_err < 1.0:
+                pass_count += 1
+            
+            # Per-object metrics
+            if obj_id not in object_metrics:
+                object_metrics[obj_id] = {'rot': [], 'trans': [], 'name': s['obj_name']}
+            object_metrics[obj_id]['rot'].append(rot_err)
+            object_metrics[obj_id]['trans'].append(trans_err)
             
         # Save Results
         if scene_name not in results:
@@ -420,7 +457,7 @@ def evaluate():
             
             # Determine Color and Thickness based on Error
             # High Error (Rot > 5 deg OR Trans > 1 cm) -> RED
-            if rot_err > 5.0 or trans_err > 1.0:
+            if args.split != 'test' and (rot_err > 5.0 or trans_err > 1.0):
                 color = (0, 0, 255) # Red (BGR)
                 thickness = 3
                 print(f"[FAIL] Scene: {scene_name} | Obj: {s['obj_name']} | Rot: {rot_err:.1f} deg, Trans: {trans_err:.1f} cm")
@@ -445,37 +482,63 @@ def evaluate():
 
     # Summary
     print(f"\nEval finished.")
-    print(f"Pass: {pass_count}/{total_count} ({100*pass_count/total_count:.2f}%)")
-    print(f"Avg Rot Err: {total_rot/total_count:.2f} deg")
-    print(f"Avg Trans Err: {total_trans/total_count:.2f} cm")
-    
-    # Per-Object Table
-    print("\n" + "="*70)
-    print(f"{'Object Name':<30} | {'Rot Err (deg)':<15} | {'Trans Err (cm)':<15}")
-    print("-" * 70)
     
     csv_rows = []
-    for oid in sorted(object_metrics.keys()):
-        m = object_metrics[oid]
-        avg_rot = np.mean(m['rot'])
-        avg_trans = np.mean(m['trans'])
-        print(f"{m['name']:<30} | {avg_rot:<15.2f} | {avg_trans:<15.2f}")
+    
+    if args.split == 'test':
+        print("\n" + "="*70)
+        print(f"{'Object Name':<30} | {'Avg Fitness':<15} | {'Avg RMSE':<15}")
+        print("-" * 70)
         
-        csv_rows.append({
-            "object_id": oid,
-            "object_name": m['name'],
-            "avg_rot_err_deg": avg_rot,
-            "avg_trans_err_cm": avg_trans,
-            "sample_count": len(m['rot'])
-        })
-    print("="*70 + "\n")
+        for oid in sorted(object_metrics.keys()):
+            m = object_metrics[oid]
+            avg_fitness = np.mean(m['fitness'])
+            avg_rmse = np.mean(m['rmse'])
+            print(f"{m['name']:<30} | {avg_fitness:<15.4f} | {avg_rmse:<15.4f}")
+            
+            csv_rows.append({
+                "object_id": oid,
+                "object_name": m['name'],
+                "avg_icp_fitness": avg_fitness,
+                "avg_icp_rmse": avg_rmse,
+                "sample_count": len(m['fitness'])
+            })
+        print("="*70 + "\n")
+        
+        csv_filename = "test_metrics_icp.csv" if use_icp else "test_metrics.csv"
+
+    else:
+        print(f"Pass: {pass_count}/{total_count} ({100*pass_count/total_count:.2f}%)")
+        print(f"Avg Rot Err: {total_rot/total_count:.2f} deg")
+        print(f"Avg Trans Err: {total_trans/total_count:.2f} cm")
+        
+        # Per-Object Table
+        print("\n" + "="*70)
+        print(f"{'Object Name':<30} | {'Rot Err (deg)':<15} | {'Trans Err (cm)':<15}")
+        print("-" * 70)
+        
+        for oid in sorted(object_metrics.keys()):
+            m = object_metrics[oid]
+            avg_rot = np.mean(m['rot'])
+            avg_trans = np.mean(m['trans'])
+            print(f"{m['name']:<30} | {avg_rot:<15.2f} | {avg_trans:<15.2f}")
+            
+            csv_rows.append({
+                "object_id": oid,
+                "object_name": m['name'],
+                "avg_rot_err_deg": avg_rot,
+                "avg_trans_err_cm": avg_trans,
+                "sample_count": len(m['rot'])
+            })
+        print("="*70 + "\n")
+
+        csv_filename = "error_metrics_icp.csv" if use_icp else "error_metrics.csv"
 
     # Save CSV
-    csv_filename = "error_metrics_icp.csv" if use_icp else "error_metrics.csv"
     csv_path = os.path.join(args.output_dir, csv_filename)
     try:
         pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
-        print(f"Saved per-object error metrics to {csv_path}")
+        print(f"Saved per-object metrics to {csv_path}")
     except PermissionError:
         print(f"[ERROR] Permission denied for {csv_path}. File is likely open in Excel/Viewer.")
         csv_path_backup = os.path.join(args.output_dir, f"backup_{csv_filename}")

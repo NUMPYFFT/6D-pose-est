@@ -92,9 +92,10 @@ class PoseDataset(Dataset):
                     if np.sum(label_img == oid) == 0:
                         continue
 
-                    # Skip if no world pose
-                    if meta['poses_world'][oid] is None:
-                        continue
+                    # Skip if no world pose (unless testing)
+                    if self.split_name != 'test':
+                        if 'poses_world' not in meta or meta['poses_world'][oid] is None:
+                            continue
 
                     # Valid training sample
                     self.samples.append((i, oid))
@@ -231,12 +232,18 @@ class PoseDataset(Dataset):
 
             # Ground truth pose
             T_wc = np.array(meta['extrinsic']).reshape(4,4)
-            T_ow = np.array(meta['poses_world'][obj_id]).reshape(4,4)
-            T_co = T_wc @ T_ow
+            
+            if self.split_name == 'test':
+                gt_R = np.eye(3, dtype=np.float32)
+                gt_t = np.zeros(3, dtype=np.float32)
+                gt_t_residual = np.zeros(3, dtype=np.float32)
+            else:
+                T_ow = np.array(meta['poses_world'][obj_id]).reshape(4,4)
+                T_co = T_wc @ T_ow
 
-            gt_R = T_co[:3,:3]
-            gt_t = T_co[:3,3]
-            gt_t_residual = gt_t - centroid
+                gt_R = T_co[:3,:3]
+                gt_t = T_co[:3,3]
+                gt_t_residual = gt_t - centroid
             
             # Object name logic for sym (only needed if not preprocessed)
             if obj_id in meta['object_ids']:

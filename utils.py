@@ -275,3 +275,8 @@ def check_class_distribution(args):
     print(f"Mean samples: {sum(counts) / len(counts):.2f}")
     print(f"Median samples: {sorted(counts)[len(counts)//2]}")
 
+if __name__ == "__main__":
+    import config
+    args = config.get_config()
+    check_class_distribution(args)
+
