@@ -26,7 +26,7 @@ class PoseDataset(Dataset):
         self.num_points = num_points
 
         # Load object info table
-        self.objects_df = pd.read_csv("benchmark_utils/objects_v1.csv")
+        self.objects_df = pd.read_csv("models/objects_v1.csv")
 
         # Cache object geometry + symmetry
         self.obj_info_cache = {}

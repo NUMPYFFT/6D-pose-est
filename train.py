@@ -1,5 +1,4 @@
 import os
-import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -132,8 +131,6 @@ def train():
     
     # Save config
     os.makedirs(args.output_dir, exist_ok=True)
-    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
-        json.dump(vars(args), f, indent=4)
         
     DEVICE = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -153,11 +150,6 @@ def train():
     val_dataset = PoseDataset("val", args.training_data_dir, args.split_dir, num_points=args.num_points, subset_size=None)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
 
-    # Visualization setup
-    vis_scene_idx = val_dataset.samples[-1][0]
-    vis_indices = [i for i, (s_idx, _) in enumerate(val_dataset.samples) if s_idx == vis_scene_idx]
-    print(f"Visualization Scene Index: {vis_scene_idx}, Objects: {len(vis_indices)}")
-
     # 2. Setup Model
     print("Using PointNet")
     model = PointNet(num_classes=args.num_classes).to(DEVICE)
@@ -169,8 +161,18 @@ def train():
     l1 = nn.L1Loss()
     writer = SummaryWriter()
 
+    # Save config to run directory
+    with open(os.path.join(writer.log_dir, 'config.txt'), 'w') as f:
+        for key, value in vars(args).items():
+            f.write(f"{key}: {value}\n")
+
     best_val_loss = float('inf')
     save_path = args.checkpoint_path
+    
+    # Ensure checkpoint directory exists
+    checkpoint_dir = os.path.dirname(save_path)
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     for epoch in range(args.epochs):
         # Train
@@ -206,30 +208,6 @@ def train():
                 'best_val_loss': best_val_loss
             }, save_path)
             print(f"Saved best model to {save_path}")
-
-        # Visualization
-        os.makedirs(f"{args.output_dir}/training_vis", exist_ok=True)
-        vis_img_path = val_dataset.rgb_files[vis_scene_idx]
-        vis_img = cv2.imread(vis_img_path)
-        
-        with torch.no_grad():
-            for idx in vis_indices:
-                sample = val_dataset[idx]
-                pts = sample['points'].unsqueeze(0).to(DEVICE)
-                obj_id = torch.tensor([sample['obj_id']]).to(DEVICE)
-                K = sample['intrinsic']
-                dims = sample['obj_dims']
-                scale = sample['scale'].numpy()
-                c = sample['centroid'].numpy()
-                
-                pred_rot6d, pred_t_res = model(pts, obj_id)
-                pred_R = utils.rotation_6d_to_matrix(pred_rot6d)[0].cpu().numpy()
-                pred_t = c + pred_t_res[0].cpu().numpy()
-                
-                size = dims * scale
-                utils.draw_projected_box3d(vis_img, pred_t, size, pred_R, np.eye(4), K, color=(0, 255, 0), thickness=2)
-        
-        cv2.imwrite(f"{args.output_dir}/training_vis/epoch_{epoch+1}_scene.png", vis_img)
 
 if __name__ == "__main__":
     train()

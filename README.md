@@ -197,9 +197,10 @@ The visual results confirm the quantitative metrics: the Green boxes consistentl
 ├── data.py             # Dataset loading (PoseDataset)
 ├── model.py            # PointNet and PointNet++ architectures
 ├── train.py            # Training script
-├── eval.py             # Evaluation script (with ICP refinement)
+├── eval.py             # Evaluation script (Inference -> Refinement -> Metrics)
+├── icp.py              # ICP logic (Refinement, Parallel Workers, Mesh Loading)
 ├── utils.py            # Utility functions (loss, visualization, geometry)
-├── benchmark_utils/    # Helper scripts and object metadata
+├── models/             # Object meshes and metadata
 ├── output_images/      # Generated visualizations
 └── TECHNICAL_REPORT.md # Detailed report
 ```
@@ -218,7 +219,7 @@ The project expects the following data structure by default (configurable in `co
 
 - Training Data: `./training_data_filtered/training_data/v2.2`
 - Splits: `./training_data_filtered/training_data/splits/v2`
-- Objects CSV: `benchmark_utils/objects_v1.csv`
+- Objects CSV: `models/objects_v1.csv`
 
 ### Usage
 
@@ -244,13 +245,13 @@ Key arguments:
 To evaluate the model with ICP refinement:
 
 ```bash
-python eval.py --model pointnet --icp_stages 3 --icp_threshold 0.02
+python eval.py --icp_stages 3 --icp_threshold 0.02 --batch_size 1
 ```
 
 To disable ICP and evaluate PointNet only:
 
 ```bash
-python eval.py --no_icp
+python eval.py --no_icp --batch_size 128
 ```
 
 Key arguments:
@@ -258,4 +259,6 @@ Key arguments:
 - `--icp_stages`: Number of ICP stages (1-3).
 - `--icp_threshold`: Coarse ICP threshold (default: 0.02).
 - `--max_rot_change`: Safety check to reject large ICP rotation changes (default: 30.0 deg).
+- `--batch_size`: Batch size for inference (default: 128).
+- `--device`: Device to run on (default: cuda).
 
