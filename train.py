@@ -10,7 +10,7 @@ import cv2
 import utils
 import loss as loss_utils
 from data import PoseDataset
-from model import PointNet
+from model import PointNet, DGCNN
 import config
 
 def train_one_epoch(model, loader, opt, device, args, pm_loss_fn, l1_loss_fn):
@@ -151,8 +151,11 @@ def train():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
 
     # 2. Setup Model
-    print("Using PointNet")
-    model = PointNet(num_classes=args.num_classes).to(DEVICE)
+    print(f"Using Model: {args.model}")
+    if args.model == 'pointnet':
+        model = PointNet(num_classes=args.num_classes).to(DEVICE)
+    elif args.model == 'dgcnn':
+        model = DGCNN(num_classes=args.num_classes).to(DEVICE)
     
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-5)

@@ -8,7 +8,7 @@ import pickle
 
 import utils
 import loss as loss_utils
-from model import PointNet
+from model import PointNet, DGCNN
 from data import PoseDataset
 import config
 import icp
@@ -291,9 +291,13 @@ def evaluate():
     val_dataset = PoseDataset(args.split, args.training_data_dir, args.split_dir, num_points=args.num_points)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    print("Loading PointNet...")
+    print(f"Loading Model: {args.model}...")
     device = torch.device(args.device)
-    model = PointNet(num_classes=args.num_classes).to(device)
+    
+    if args.model == 'pointnet':
+        model = PointNet(num_classes=args.num_classes).to(device)
+    elif args.model == 'dgcnn':
+        model = DGCNN(num_classes=args.num_classes).to(device)
 
     checkpoint_path = args.checkpoint_path
     

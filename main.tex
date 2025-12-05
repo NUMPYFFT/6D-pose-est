@@ -1,0 +1,175 @@
+\documentclass[10.5pt,letterpaper]{article}
+\usepackage[letterpaper,margin=0.5in]{geometry}
+\geometry{
+ top=10mm,
+}
+\usepackage[utf8]{inputenc}
+\usepackage{mdwlist}
+\usepackage[T1]{fontenc}
+\usepackage{textcomp}
+\usepackage{tgpagella}
+\pagestyle{empty}
+\setlength{\tabcolsep}{0em}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fontawesome5}
+\usepackage{array}
+\setlist[itemize]{leftmargin=1.5em}
+% \setlist[itemize]{leftmargin=*}
+
+% indentsection style, used for sections that aren't already in lists
+% that need indentation to the level of all text in the document
+\newenvironment{indentsection}[1]%
+{\begin{list}{}%
+    {\setlength{\leftmargin}{#1}}%
+    \item[]%
+}
+{\end{list}}
+
+% opposite of above; bump a section back toward the left margin
+\newenvironment{unindentsection}[1]%
+{\begin{list}{}%
+    {\setlength{\leftmargin}{-0.5#1}}%
+    \item[]%
+}
+{\end{list}}
+
+% format two pieces of text, one left aligned and one right aligned
+\newcommand{\headerrow}[2]
+{\begin{tabular*}{\linewidth}{l@{\extracolsep{\fill}}r}
+    #1 &
+    #2 \\
+\end{tabular*}}
+
+\begin{document}
+
+% Contact Information
+\begin{center}
+{\LARGE \textbf{Chengjun Lu}}
+\\\vspace{0.5em}
+\faPhone\ (217) 418-9736 
+\quad \textbullet \quad
+\faEnvelope\ \href{mailto:chl253@ucsd.edu}{chl253@ucsd.edu}
+% \quad \textbullet \quad
+% \faGithub\ \href{https://github.com/NUMPYFFT}{NUMPYFFT}
+\end{center}
+
+% Education Section
+\subsection*{Education}
+\vspace{-0.3em}\hrule\vspace{0.2em}
+\begin{itemize}
+    \parskip=0.1em
+
+    \item 
+    \headerrow
+        {\textbf{University of California San Diego}}
+        {\textbf{}}
+    \\
+    \headerrow
+        {M.S Electrical and Computer Engineering}
+        {\emph{Sep 2023 -- Present}}
+        
+    \item 
+    \headerrow
+        {\textbf{University of Illinois at Urbana-Champaign}}
+        {\textbf{}}
+    \\
+    \headerrow
+        {B.S Electrical and Computer Engineering (Honor/GPA 3.7)}
+        {\emph{Aug 2019 -- May 2023}}
+
+    
+
+    \item
+    \headerrow
+        {\textbf{Relevant Coursework}}
+        {\textbf{}}
+    \\
+    Algorithm Design and Analysis
+    $\cdot$ Numerical Methods
+    $\cdot$ Digital Signal Processing
+    $\cdot$ Classical AI
+    $\cdot$ Machine Learning and Computer Vision
+    $\cdot$ Natural Language Processing
+    $\cdot$ Robotics and Reinforcement Learning
+
+\end{itemize}
+
+\subsection*{Publications}
+\vspace{-0.3em}\hrule\vspace{0.2em}
+\begin{itemize}
+    \item Rishub Tamirisa, John Won, \textbf{Chengjun Lu}, Ron Arel, Andy Zhou. "FedSelect: Customized Selection of Parameters for Fine-Tuning during Personalized Federated Learning. \textit{ICML Federated Learning Workshop}, 2023
+\end{itemize}
+
+% Relevant Experience
+\vspace{-1.3em}
+\subsection*{Experience}
+\vspace{-0.6em}\hrule\vspace{0.2em}
+
+\begin{itemize}
+    \item
+    \headerrow
+        {\textbf{Data-Efficient Robot Learning with SAC Variants}}
+        {\emph{April 2024 - August 2024}}
+    \begin{itemize*}\vspace{-0.7em}
+        \item Accelerated reinforcement learning convergence by augmenting \textbf{Soft Actor-Critic (SAC)} with expert demonstrations collected via \textbf{ManiSkill}, training with a balanced 50:50 mixture of offline and online data.
+        \item Engineered a modified \textbf{Twin Delayed DDPG (TD3)} algorithm incorporating \textbf{imitation loss} to bias policy learning, significantly reducing random exploration and outperforming traditional SAC baselines.
+    \end{itemize*}
+
+    \item
+    \headerrow
+        {\textbf{6D Pose Estimation System}}
+        {\emph{March 2025 - June 2025}}
+    \begin{itemize*}\vspace{-0.7em}
+        \item Designed an end-to-end system for robotic grasping that predicts object orientation and position from raw point clouds.
+        \item Trained a \textbf{PointNet} architecture for coarse global pose regression and implemented a robust \textbf{3-stage ICP} algorithm for fine local alignment.
+        \item Developed a custom \textbf{symmetry-aware loss function} to handle geometric ambiguities for symmetric objects (e.g., cylinders, boxes), improving convergence stability.
+        \item Resolved "sliding" issues for planar objects by implementing a hybrid Point-to-Plane and Point-to-Point registration strategy, achieving sub-millimeter residual error ($\sim$1.6mm RMSE).
+    \end{itemize*}
+
+    \item
+    \headerrow
+        {\textbf{A Re-implementation of NeRF from scratch}}
+        {\emph{Oct 2023 - Dec 2023}}
+    \begin{itemize*}\vspace{-0.7em}
+        \item Implemented \textbf{Neural Radiance Fields (NeRF)} from scratch in \textbf{PyTorch}, achieving >30 PSNR on custom datasets without relying on existing NeRF libraries.
+        \item Optimized volumetric rendering by implementing patch-based pixel segmentation, achieving a \textbf{2x speedup} in inference time compared to conventional methods.
+    \end{itemize*}
+
+    \item
+    \headerrow
+        {\textbf{Wavelet-Based Feature Space Augmentation for Domain Generalization}} 
+        {\emph{Sep 2024 - Dec 2024}}
+        
+    \begin{itemize*}\vspace{-0.7em}
+        \item Introduced a Wavelet-Attention Unit replacing pooling and stride layers with \textbf{Discrete Wavelet Transform (DWT)} for frequency-preserving downsampling, ensuring adaptive feature extraction.
+        \item Developed a frequency-space augmentation technique applied to feature representations, improving \textbf{domain generalization} by enhancing robustness against domain shifts with minimal computational overhead.
+        \item Achieved a 4.4\% accuracy boost over a baseline \textbf{CNN} and 0.7\% improvement over standard feature-space augmentation on VLCS, validating the effectiveness of frequency-aware learning.
+    \end{itemize*}
+    
+    \item
+    \headerrow
+        {\textbf{Federated Learning with Lottery Ticket Hypothesis}} 
+        {\emph{February 2023 - July 2023}}
+    \begin{itemize*}\vspace{-0.7em}
+        \item Refined and fine-tuned sub-networks of local clients, termed as non-lottery tickets, integrating these enhancements during multiple communication rounds to strengthen the global model.
+        \item Innovatively adjusted client model architectures and parameters throughout the training process, employing a tailored approach to the \textbf{Lottery Ticket Hypothesis} to optimize learning efficacy.
+    \end{itemize*}
+\end{itemize}
+
+
+% Skills
+\subsection*{Skills}
+\vspace{-0.4em}\hrule\vspace{0.3em}
+\begin{tabular}{ @{} >{\bfseries}l @{\hspace{6ex}} l }
+Programming Languages & Python, MATLAB, SystemVerilog \& Verilog, C/C++, Java \\
+Frameworks/Packages & PyTorch, TensorFlow, ROS \\
+Spoken Languages & Chinese, English \\
+\end{tabular}
+
+% Awards and Honors
+% \subsection*{Awards and Honors}
+% \vspace{-0.4em}\hrule\vspace{0.3em}
+% Bradley A. Simmons Memorial Scholarship, 2021
+
+\end{document}
