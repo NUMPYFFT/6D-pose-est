@@ -10,7 +10,16 @@ Below is an example of the system's output on the **Test Set** (unseen data).
 *   **Green Box**: Final Prediction (ICP Refined)
 *   **Red Box**: Initial Prediction (PointNet)
 
-![Test Set Result](assets/2-50-1.png)
+![Test Set Result](assets/2-48-1.png)
+
+## Performance
+
+Evaluated on the validation set (1717 samples):
+
+| Method | Pass Rate (< 5°, < 1cm) | Avg Rotation Error | Avg Translation Error |
+| :--- | :--- | :--- | :--- |
+| **PointNet (Initial)** | 91.85% | 3.70° | 0.21 cm |
+| **PointNet + ICP (Final)** | **93.65%** | **2.85°** | **0.19 cm** |
 
 ## Project Structure
 
@@ -18,13 +27,13 @@ Below is an example of the system's output on the **Test Set** (unseen data).
 .
 ├── config.py           # Centralized configuration (argparse)
 ├── data.py             # Dataset loading (PoseDataset)
-├── model.py            # PointNet and PointNet++ architectures
+├── model.py            # PointNet and DGCNN architectures
 ├── train.py            # Training script
 ├── eval.py             # Evaluation script (Inference -> Refinement -> Metrics)
 ├── icp.py              # ICP logic (Refinement, Parallel Workers, Mesh Loading)
 ├── utils.py            # Utility functions (loss, visualization, geometry)
+├── preprocess.py       # Data preprocessing script
 ├── models/             # Object meshes and metadata
-├── output_images/      # Generated visualizations
 └── TECHNICAL_REPORT.md # Detailed report
 ```
 
@@ -77,7 +86,14 @@ To disable ICP and evaluate PointNet only:
 python eval.py --no_icp --batch_size 128
 ```
 
+To evaluate on the **Test Set** (generates `test_metrics_icp.csv`):
+
+```bash
+python eval.py --split test --checkpoint_path model_weights/pointnet_v2.pth
+```
+
 Key arguments:
+- `--split`: Dataset split to use (`val` or `test`).
 - `--no_icp`: Disable ICP refinement.
 - `--icp_stages`: Number of ICP stages (1-3).
 - `--icp_threshold`: Coarse ICP threshold (default: 0.02).

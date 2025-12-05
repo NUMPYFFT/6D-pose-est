@@ -15,3 +15,14 @@ runs
 benchmark_utils
 *.pyc
 __pycache__/
+
+# Local development files
+hw2_docs/
+see_data.ipynb
+inspect_pkl.py
+main.tex
+output_images_test/
+*.ipynb
+*.log
+*.aux
+*.out

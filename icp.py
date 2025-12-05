@@ -201,6 +201,11 @@ def run_icp_refinement(samples_to_process, use_icp):
                 i = futures[future]
                 try:
                     refined_R, refined_t, fitness, rmse = future.result()
+                    
+                    # Save initial pose before overwriting
+                    samples_to_process[i]['init_R'] = samples_to_process[i]['pred_R'].copy()
+                    samples_to_process[i]['init_t'] = samples_to_process[i]['pred_t'].copy()
+                    
                     samples_to_process[i]['pred_R'] = refined_R
                     samples_to_process[i]['pred_t'] = refined_t
                     samples_to_process[i]['icp_fitness'] = fitness

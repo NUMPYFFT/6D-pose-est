@@ -4,7 +4,7 @@ def get_config(args=None):
     parser = argparse.ArgumentParser(description="6D Pose Estimation Configuration")
 
     # Model
-    parser.add_argument("--model", type=str, default="dgcnn", choices=["pointnet", "dgcnn"], help="Model architecture")
+    parser.add_argument("--model", type=str, default="pointnet", choices=["pointnet", "dgcnn"], help="Model architecture")
     parser.add_argument("--num_points", type=int, default=1024, help="Number of points to sample")
     parser.add_argument("--num_classes", type=int, default=79, help="Number of object classes")
 
@@ -33,7 +33,7 @@ def get_config(args=None):
     parser.add_argument("--training_data_dir", type=str, default="./training_data_filtered/training_data/v2.2", help="Path to training data")
     parser.add_argument("--split_dir", type=str, default="./training_data_filtered/training_data/splits/v2", help="Path to split files")
     parser.add_argument("--objects_csv", type=str, default="models/objects_v1.csv", help="Path to objects CSV")
-    parser.add_argument("--checkpoint_path", type=str, default="model_weights/dgcnn_v1.pth", help="Path to save checkpoint")
+    parser.add_argument("--checkpoint_path", type=str, default="model_weights/pointnet_v2.pth", help="Path to save checkpoint")
     parser.add_argument("--output_dir", type=str, default="output_images", help="Directory for output images")
 
     return parser.parse_args(args)

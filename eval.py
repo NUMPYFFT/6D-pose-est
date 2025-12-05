@@ -135,6 +135,10 @@ def compute_metrics_and_visualize(samples_to_process, args, out_dir):
     scene_img = None
     
     total_rot = total_trans = total_count = pass_count = 0
+    
+    # Initial metrics (PointNet only)
+    init_total_rot = init_total_trans = init_pass_count = 0
+    
     csv_rows = []
 
     for s in tqdm(samples_to_process, desc="Metrics"):
@@ -162,6 +166,7 @@ def compute_metrics_and_visualize(samples_to_process, args, out_dir):
             object_metrics[obj_id]['rmse'].append(s['icp_rmse'])
             
         else:
+            # 1. Final (Refined) Metrics
             rot_err = loss_utils.compute_symmetry_aware_loss(pred_R, gt_R, sym)
             trans_err = np.linalg.norm(pred_t - gt_t) * 100
 
@@ -171,6 +176,22 @@ def compute_metrics_and_visualize(samples_to_process, args, out_dir):
             if rot_err < 5.0 and trans_err < 1.0:
                 pass_count += 1
             
+            # 2. Initial (PointNet) Metrics
+            if 'init_R' in s:
+                init_rot_err = loss_utils.compute_symmetry_aware_loss(s['init_R'], gt_R, sym)
+                init_trans_err = np.linalg.norm(s['init_t'] - gt_t) * 100
+                
+                init_total_rot += init_rot_err
+                init_total_trans += init_trans_err
+                if init_rot_err < 5.0 and init_trans_err < 1.0:
+                    init_pass_count += 1
+            else:
+                # If no ICP, initial is same as final
+                init_total_rot += rot_err
+                init_total_trans += trans_err
+                if rot_err < 5.0 and trans_err < 1.0:
+                    init_pass_count += 1
+
             # Per-object metrics
             if obj_id not in object_metrics:
                 object_metrics[obj_id] = {'rot': [], 'trans': [], 'name': s['obj_name']}
@@ -207,8 +228,24 @@ def compute_metrics_and_visualize(samples_to_process, args, out_dir):
             K_scaled[0, 2] *= 2
             K_scaled[1, 2] *= 2
 
+            # 1. Draw Initial Pose (Red)
+            if 'init_R' in s:
+                utils.draw_projected_box3d(scene_img, s['init_t'], size, s['init_R'],
+                                           np.eye(4), K_scaled, color=(0, 0, 255), thickness=2)
+
+            # 2. Draw Final Pose (Green)
+            # We use Green for the final prediction to match the README description.
+            # If you want to encode error, you could change this color.
+            color = (0, 255, 0) 
+            thickness = 2
+            
             utils.draw_projected_box3d(scene_img, pred_t, size, pred_R,
                                        np.eye(4), K_scaled, color=color, thickness=thickness)
+
+            # 3. Draw Ground Truth (Blue) - Optional, for validation only
+            if args.split != 'test':
+                 utils.draw_projected_box3d(scene_img, gt_t, size, gt_R,
+                                            np.eye(4), K_scaled, color=(255, 0, 0), thickness=1) # Blue (BGR)
 
     # Save last scene
     if scene_img is not None:
@@ -238,6 +275,12 @@ def compute_metrics_and_visualize(samples_to_process, args, out_dir):
         print("="*70 + "\n")
 
     else:
+        print(f"\n--- Initial (PointNet) ---")
+        print(f"Pass: {init_pass_count}/{total_count} ({100*init_pass_count/total_count:.2f}%)")
+        print(f"Avg Rot Err: {init_total_rot/total_count:.2f} deg")
+        print(f"Avg Trans Err: {init_total_trans/total_count:.2f} cm")
+
+        print(f"\n--- Final (ICP Refined) ---")
         print(f"Pass: {pass_count}/{total_count} ({100*pass_count/total_count:.2f}%)")
         print(f"Avg Rot Err: {total_rot/total_count:.2f} deg")
         print(f"Avg Trans Err: {total_trans/total_count:.2f} cm")

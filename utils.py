@@ -66,8 +66,21 @@ def draw_projected_box3d(image, center, size, rotation, extrinsic, intrinsic, th
     
     # Project to 2D
     corners_2d_hom = (intrinsic @ corners_cam.T).T
+    
+    # Check for valid depth to avoid division by zero or negative depth issues
+    if np.any(corners_2d_hom[:, 2] <= 0) or np.any(np.isnan(corners_2d_hom)) or np.any(np.isinf(corners_2d_hom)):
+        return
+
     corners_2d = corners_2d_hom[:, :2] / corners_2d_hom[:, 2:3]
-    corners_2d = corners_2d.astype(int)
+    
+    # Check for valid 2D coordinates before casting
+    if np.any(np.isnan(corners_2d)) or np.any(np.isinf(corners_2d)):
+        return
+        
+    try:
+        corners_2d = corners_2d.astype(int)
+    except (ValueError, OverflowError):
+        return
     
     # Generate random color if not specified
     if color is None:
@@ -90,10 +103,13 @@ def draw_projected_box3d(image, center, size, rotation, extrinsic, intrinsic, th
         pt2 = tuple(corners_2d[edge[1]])
         
         # Check if points are within reasonable bounds and have positive depth
-        if (corners_cam[edge[0], 2] > 0 and corners_cam[edge[1], 2] > 0 and
-            -w_img < pt1[0] < 2*w_img and -h_img < pt1[1] < 2*h_img and
-            -w_img < pt2[0] < 2*w_img and -h_img < pt2[1] < 2*h_img):
-            cv2.line(image, pt1, pt2, color, thickness)
+        # Relaxed bounds check to allow drawing even if partially off-screen
+        if (corners_cam[edge[0], 2] > 0 and corners_cam[edge[1], 2] > 0):
+             # Clip to image bounds for safety, but try to draw
+             # Actually cv2.line handles clipping, we just need to ensure coordinates are not insane (overflow)
+             if (-10000 < pt1[0] < 10000 and -10000 < pt1[1] < 10000 and
+                 -10000 < pt2[0] < 10000 and -10000 < pt2[1] < 10000):
+                cv2.line(image, pt1, pt2, color, thickness)
 
 def check_class_distribution(args):
     print(f"Checking class distribution for split: train")
