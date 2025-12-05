@@ -9,6 +9,7 @@ output_images
 output_images_pointnet
 *.pth
 *.png
+!assets/*.png
 runs
 
 benchmark_utils
