@@ -39,10 +39,10 @@ Evaluated on the validation set (1717 samples):
 
 ## Installation
 
-Ensure you have the following dependencies installed:
+Install the required dependencies:
 
 ```bash
-pip install torch torchvision numpy pandas opencv-python tqdm open3d trimesh
+pip install -r requirements.txt
 ```
 
 ## Data Setup
@@ -58,6 +58,18 @@ The project expects the following data structure by default (configurable in `co
 ### Configuration
 
 All hyperparameters and paths are defined in `config.py`. You can override them via command-line arguments.
+
+### Data Preprocessing
+
+To speed up training and evaluation, we preprocess the dataset (point cloud generation, downsampling, normal estimation) and save it to disk.
+
+```bash
+python preprocess.py --split train
+python preprocess.py --split val
+python preprocess.py --split test
+```
+
+This will create a `preprocessed/` folder inside your data directory containing `.npz` files for each sample.
 
 ### Training
 

@@ -12,7 +12,7 @@ from model import PointNet, DGCNN
 from data import PoseDataset
 import config
 import icp
-from matplotlib.cm import get_cmap
+import matplotlib.pyplot as plt
 
 # -------------------------------------------------------------------------
 # Inference Loop
@@ -123,7 +123,7 @@ def compute_metrics_and_visualize(samples_to_process, args, out_dir):
     
     # Setup Color Palette
     NUM_OBJECTS = 79
-    cmap = get_cmap('rainbow', NUM_OBJECTS)
+    cmap = plt.get_cmap('rainbow', NUM_OBJECTS)
     COLOR_PALETTE = np.array([cmap(i)[:3] for i in range(NUM_OBJECTS + 3)])
     COLOR_PALETTE = np.array(COLOR_PALETTE * 255, dtype=np.uint8)
     COLOR_PALETTE[-3] = [119, 135, 150]
