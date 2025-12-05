@@ -182,14 +182,14 @@ The visual results confirm the quantitative metrics: the Green boxes consistentl
 ### Challenging Scene: Small Object (Lego Duplo)
 The `a_lego_duplo` is particularly difficult due to its small size and symmetry. Despite sparse points, the ICP refinement (Green) successfully aligns with the object.
 
-![Lego Duplo Result](output_images/pointnet_icp/1-19-1.png)
+![Lego Duplo Result](assets/1-19-1.png)
 
 ### Robust Alignment: Occluded Object (Bleach Cleanser)
 Even with partial occlusion, the system recovers the correct 6D pose.
 
-![Bleach Cleanser Result](output_images/pointnet_icp/1-20-8.png)
+![Bleach Cleanser Result](assets/1-20-8.png)
 
 ### Test Set Prediction (Unseen Data)
 The following result is from the held-out test set, where no ground truth was available during training or validation. The tight bounding box alignment indicates successful generalization.
 
-![Test Set Result](output_images_test/pointnet_icp/2-50-1.png)
+![Test Set Result](assets/2-50-1.png)

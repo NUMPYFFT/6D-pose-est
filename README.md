@@ -10,7 +10,7 @@ Below is an example of the system's output on the **Test Set** (unseen data).
 *   **Green Box**: Final Prediction (ICP Refined)
 *   **Red Box**: Initial Prediction (PointNet)
 
-![Test Set Result](output_images_test/pointnet_icp/2-50-1.png)
+![Test Set Result](assets/2-50-1.png)
 
 ## Project Structure
 
