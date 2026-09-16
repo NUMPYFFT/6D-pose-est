@@ -1,211 +1,130 @@
-# Technical Report: Robust 6D Pose Estimation with PointNet + ICP
+# Technical Report: 6D Pose Estimation with PointNet and Guarded ICP
 
-## 1. Mathematical Formulation
+## 1. Goal
 
-### 1.1 Problem Definition
-Given an observed point cloud $P = \{p_i \in \mathbb{R}^3\}_{i=1}^N$ derived from a depth image and a canonical object model $M = \{m_j \in \mathbb{R}^3\}_{j=1}^K$, our goal is to estimate the rigid transformation $(R, t) \in SE(3)$ that aligns the model to the observation:
-$$ p_i \approx R m_j + t $$
+Given an RGB-D image, an object segmentation mask, and a canonical mesh for a known object class, estimate the object-to-camera pose
 
-### 1.2 PointNet for Coarse Pose Estimation
-We employ a PointNet-based architecture to regress the 6D pose directly from the segmented point cloud.
-*   **Input**: $N \times 3$ point cloud (centered).
-*   **Output**: Rotation quaternion $q \in \mathbb{R}^4$ (or 6D representation) and translation residual $t_{res} \in \mathbb{R}^3$.
+$$T_{co} = \begin{bmatrix}R & t\\0 & 1\end{bmatrix}, \qquad R \in SO(3),\; t \in \mathbb{R}^3.$$
 
-**Loss Function**:
-To handle both symmetric and asymmetric objects, we utilize a symmetry-aware loss function.
-For an **asymmetric object**, we use the standard $L_2$ loss (ADD):
-$$ L_{ADD} = \frac{1}{N} \sum_{x \in M} \| (Rx + t) - (\hat{R}x + \hat{t}) \|^2 $$
+The system uses PointNet to predict a coarse pose from the visible object point cloud, then uses local geometric registration to refine that pose when the refinement is reliable.
 
-For a **symmetric object**, we use the Chamfer Distance (ADD-S), which minimizes the distance to the *nearest* point rather than a fixed correspondence:
-$$ L_{ADD-S} = \frac{1}{N} \sum_{x_1 \in M} \min_{x_2 \in M} \| (Rx_1 + t) - (\hat{R}x_2 + \hat{t}) \|^2 $$
-This allows the network to learn valid poses for symmetric objects (e.g., a bowl) without being penalized for rotational ambiguity.
+## 2. Data and Coordinate Frames
 
-### 1.3 Iterative Closest Point (ICP) Refinement
-The network prediction $(\hat{R}, \hat{t})$ serves as the initialization for ICP. We solve for the incremental transformation $T_{inc}$ that minimizes the alignment error.
+- **Camera frame:** Depth pixels are back-projected with the camera intrinsics $K$.
+- **Object frame:** Canonical mesh coordinates, scaled using the per-instance metadata scale.
+- **Registration:** The scaled object mesh is aligned directly to the observed object point cloud in the camera frame.
+- **Ground truth:** For labelled train/validation scenes, $T_{co}=T_{wc}T_{ow}$.
 
-**Point-to-Plane Objective (Stages 1 & 2)**:
-Minimizes the distance between a source point $s_i$ and the tangent plane at the target point $d_i$ with normal $n_i$:
-$$ E_{plane} = \sum_{i} ((T_{inc} s_i - d_i) \cdot n_i)^2 $$
-This allows the source points to slide along planar surfaces, which helps convergence but can cause drift.
+Each input cloud is extracted using the object label mask, voxel-downsampled at 5 mm, supplied with RGB and camera-oriented normals, centred, and sampled to 1,024 points. The network input is therefore $N\times9$: XYZ, RGB, and normal components.
 
-**Point-to-Point Objective (Stage 3)**:
-Minimizes the Euclidean distance between corresponding points:
-$$ E_{point} = \sum_{i} \| T_{inc} s_i - d_i \|^2 $$
-This constrains the sliding and "locks" the object in place.
+The train, validation, and test point-cloud caches have been generated from their matching data roots. This avoids the earlier issue where a cache from one dataset was paired with images from another dataset, which produced misleading overlays and invalid evaluation results.
 
-## 2. Algorithm Overview
+## 3. Model
 
-Our solution implements a robust 6D pose estimation pipeline using Iterative Closest Point (ICP) registration. The algorithm takes RGB-D images and object masks as input and refines the pose of each object to match the observed scene depth.
+The current learned baseline is PointNet with class conditioning:
 
-### General Flow
+1. Shared pointwise MLP: $9\rightarrow64\rightarrow128\rightarrow1024$.
+2. Max pooling produces a permutation-invariant global feature.
+3. A learned object-ID embedding is concatenated with that feature.
+4. Separate heads predict a 6D rotation representation and a centroid-relative translation residual.
 
-1.  **Data Loading**:
-    *   Load RGB images, Depth maps, Label masks, and Metadata (intrinsics, extrinsics, initial poses) from the dataset.
-    *   Load 3D object meshes (`.dae` files) and apply scale factors from metadata.
+The 6D rotation prediction is converted to an orthonormal rotation matrix. Translation is reconstructed as
 
-2.  **Preprocessing**:
-    *   **Scene Point Cloud**: Back-project depth pixels to 3D points using camera intrinsics.
-    *   **Target Extraction**: Mask the scene point cloud using the ground truth label to isolate the target object.
-    *   **Downsampling**: Apply **Voxel Downsampling** (5mm voxel size) to the target point cloud. This ensures uniform point density, preserving geometric features like corners and edges better than random sampling.
-    *   **Normal Estimation**: Estimate normals for both source (mesh) and target (scene) point clouds. Crucially, target normals are **oriented towards the camera** to ensure consistency.
+$$t=\bar{p}+t_{res},$$
 
-### Coordinate Systems & Scaling
+where $\bar{p}$ is the observed-cloud centroid.
 
-*   **Canonical Models**: The 3D object meshes (`.dae` files) are defined in their own local **Object Frame**.
-*   **Scaling**: The dataset provides a `scale` factor for each object in the metadata. When loading the mesh, we sample points and immediately multiply them by this `scale` factor to match the physical dimensions of the object in the scene.
-*   **Extents**: The `extent` (bounding box dimensions) provided in the metadata is also multiplied by the `scale` factor before being used for visualization.
-*   **Depth Image**: The depth image is back-projected using the camera intrinsics ($K$) to form a point cloud in the **Camera Frame**.
-*   **Registration Frame**: All ICP registration is performed in the **Camera Frame**.
-    *   The initial pose ($T_{co\_init}$) is computed by transforming the ground truth Object-to-World pose ($T_{ow}$) using the World-to-Camera extrinsics ($T_{wc}$): $T_{co} = T_{wc} \times T_{ow}$.
-    *   The source point cloud (scaled mesh) is transformed by this initial pose to align it with the target point cloud (scene) in the Camera Frame.
+Training combines point-matching, symmetry-aware geodesic rotation, and translation losses. Symmetry is taken from the project symmetry table rather than the CSV geometry label, so equivalent poses are not penalized as errors.
 
-3.  **Registration Pipeline (Multi-Stage ICP)**:
-    The core registration uses a coarse-to-fine approach with fallback logic:
-    *   **Initialization**: Start with the ground truth pose provided in the metadata (simulating a coarse pose estimator output).
-    *   **Stage 1 (Coarse)**: Run **Point-to-Plane ICP** with a loose threshold (2cm). This aligns the general shape of the object.
-    *   **Stage 2 (Fine)**: Run **Point-to-Plane ICP** with a tighter threshold (1cm). This refines the alignment based on surface geometry.
-    *   **Stage 3 (Anti-Sliding)**: Run **Point-to-Point ICP** with a tight threshold (1cm). This locks points to their nearest neighbors, preventing planar objects from sliding along their surfaces (a common issue with Point-to-Plane).
+### Occlusion and pose-diversity augmentation
 
-4.  **Evaluation**:
-    *   **Symmetry Handling**: Compute rotation error using a symmetry-aware metric. The system parses geometric symmetries (e.g., "z2", "inf") from `objects_v1.csv` and calculates the minimum error over all valid symmetric rotations.
-    *   **Metrics**:
-        *   Rotation Error (deg): Angle between predicted and GT rotation (modulo symmetry).
-        *   Translation Error (cm): Euclidean distance between predicted and GT centroids.
-    *   **Pass Criteria**: Rotation Error < 20 degrees AND Translation Error < 2 cm.
+The current training code now includes partial-view augmentation. With probability 0.65, it removes one contiguous side of the centred cloud and keeps 55–90% of its points before resampling. The retained points are re-centred and the translation residual is adjusted to the new centroid, preserving the coordinate convention used at inference. This represents the blocked object surfaces common in difficult scenes. Standard small XYZ jitter and rigid pose perturbations remain enabled during training.
 
-    *   **Visualization**:
-    *   Generate high-resolution output images.
-    *   Overlay 3D bounding boxes on a colorful segmentation mask background.
-    *   Bounding boxes are drawn directly in the Camera Frame to avoid coordinate system transformation errors.
+The initial small rigid perturbation is limited to $\pm30°$ on each camera axis. After inspecting scene `2-6-3`, we found that a laid-down mustard bottle and bleach cleanser were instead predicted upright (about $98°$ and $86°$ rotation error, respectively), despite 1,078 and 1,537 valid observed points. The failure is therefore not caused by sparse crops; it is a large orientation-distribution gap. Guarded ICP correctly left the poses unchanged because its correction radius is local.
 
-## 3. Experimental Results
+To address this, training now applies an additional $\pm90°$ quarter-turn around the camera $x$ or $y$ axis with probability 0.50, plus a $180°$ horizontal-axis flip with probability 0.15. It is applied identically to centred XYZ, normals, the rotation target, and the centroid-relative translation residual, generating physically relevant side-lying and flipped orientations while preserving the established pose convention. This synthetic orientation enrichment is preferable to trying to label every mesh's local "up" direction, which is not consistent across object coordinate systems.
 
-We evaluated the system on the validation set (1717 samples) to quantify the performance improvement provided by the ICP refinement stage.
+These augmentation changes require retraining and evaluation before their effect can be reported as an improvement.
 
-### 3.1 Quantitative Metrics
+## 4. Guarded ICP Refinement
 
-| Method | Pass Rate (< 5°, < 1cm) | Avg Rotation Error | Avg Translation Error |
-| :--- | :--- | :--- | :--- |
-| **PointNet (Initial)** | 91.85% | 3.70° | 0.21 cm |
-| **PointNet + ICP (Final)** | **93.65%** | **2.85°** | **0.19 cm** |
+PointNet's prediction initializes three-stage ICP:
 
-### 3.2 Analysis
-*   **Accuracy Gain**: The ICP refinement stage improved the overall pass rate by **1.8%**.
-*   **Precision**: The most significant improvement was in rotational precision, reducing the average error by **0.85 degrees**. This is critical for tasks requiring precise alignment, such as robotic grasping or insertion.
-*   **Translation**: Translation error was already very low (0.21 cm) with the coarse PointNet model, but ICP further refined it to **0.19 cm**.
+| Stage | Objective | Distance threshold |
+|---|---|---|
+| 1 | Point-to-plane | 1.0 cm |
+| 2 | Point-to-plane | 0.5 cm |
+| 3 | Point-to-point | 0.25 cm |
 
----
+Target normals are oriented toward the camera. Point-to-plane ICP obtains a coarse surface alignment; the final point-to-point stage reduces sliding along broad planar faces.
 
-## Technical Challenges & Solutions
+ICP is **guarded**. Before refinement, the system evaluates the PointNet pose at the same registration scale. A refined pose is accepted only if it:
 
-### 1. Visualization Misalignment
-*   **Problem**: Initially, projected bounding boxes appeared misaligned or "too big", leading to confusion about whether the error was in the pose estimation or the visualization logic.
-*   **Solution**: We verified the scale of the meshes against the point clouds (finding them correct). The root cause was coordinate frame confusion. We switched to drawing bounding boxes directly in the **Camera Frame** using identity extrinsics, which eliminated inversion errors and aligned the visuals perfectly.
+- changes rotation by at most the configured limit (10° by default);
+- changes translation by at most 1 cm;
+- does not materially reduce fitness or worsen RMSE; and
+- provides a meaningful improvement in fitness or RMSE.
 
-### 2. ICP Divergence
-*   **Problem**: In early tests, ICP would sometimes "explode" or drift far away from the object, resulting in massive errors.
-*   **Solution**: This is often caused by inconsistent normal orientation. We added `target_pcd.orient_normals_towards_camera_location([0,0,0])` to ensure all normals pointed towards the camera, providing a consistent gradient for the Point-to-Plane objective.
+Otherwise the PointNet pose is retained. This is intended to prevent an apparently plausible ICP local minimum from degrading correct predictions for heavily occluded or symmetric objects.
 
-### 3. Symmetry Ambiguity
-*   **Problem**: Symmetric objects like `cracker_box` (180-degree symmetry) and `lego_duplo` (90-degree symmetry) showed high rotation errors (e.g., ~180 deg) even when visually aligned.
-*   **Solution**: We implemented a robust `compute_min_symmetry_loss` function. It parses the symmetry string (e.g., "z2|x2") from the object database, generates all valid symmetry rotation matrices, and reports the minimum error. We also relaxed the strict rotation pass threshold to 20 degrees to account for dataset noise.
+### Quarter-turn fallback for large orientation ambiguity
 
-### 4. Translation Error (The "Sliding" Problem)
-*   **Problem**: Planar objects like `wood_block` consistently failed the translation metric (> 2cm error) despite good rotational alignment. They were "sliding" along their flat surfaces because Point-to-Plane ICP only penalizes perpendicular distance, not tangential movement.
-*   **Solution**: We introduced **Stage 3: Point-to-Point ICP**. Unlike Point-to-Plane, Point-to-Point penalizes the distance between specific point pairs. This effectively "locks" the object in place once the surface is aligned, reducing translation error for the `wood_block` from ~5cm to < 0.5cm.
+Normal guarded ICP is deliberately local and therefore cannot correct a PointNet pose that is roughly 90° wrong. An optional fallback is triggered only when normal ICP is rejected and the observed crop has at least 200 points. It tests eight PointNet-derived hypotheses ($\pm90°$ about axis-aligned and diagonal horizontal camera axes), locally refines each, and accepts one only if its registration fitness clearly exceeds the original pose while RMSE remains competitive. This is a targeted mechanism for laid-down objects; severely occluded crops remain unmodified because they lack enough evidence for trustworthy hypothesis selection.
 
-### 5. Overfitting and Local Minima
-*   **Problem**: The algorithm struggled with complex shapes or failed on specific scenes (e.g., `e_lego_duplo`), getting stuck in local minima.
-*   **Solution**:
-    *   **Voxel Downsampling**: We replaced random sampling with uniform voxel downsampling. This ensures that corners and edges (high-frequency features) are represented in the point cloud, giving ICP better constraints than just flat faces.
-    *   **Relaxed Thresholds**: We increased the fine alignment threshold from 0.5cm to 1cm. A too-tight threshold was rejecting valid correspondences due to sensor noise or mesh imperfections, causing divergence.
-    *   **Fallback Logic**: We added checks after each stage. If a stage fails (fitness = 0), the pipeline falls back to the result of the previous stage instead of returning a garbage pose.
+Pure ICP (FPFH/RANSAC followed by local ICP) is retained only as a classical baseline. It is not used in the main learned pipeline because global correspondences can be too sparse for small, symmetric, or partially visible objects.
 
-## Experimental Results
+## 5. Evaluation Protocol
 
-We conducted a series of ablation studies to validate the effectiveness of our PointNet + ICP pipeline.
+Only labelled train/validation data is used for pose-error metrics. Objects with fewer than 50 valid points are excluded.
 
-### Summary of Experiments
+- **Rotation error:** symmetry-aware angular error in degrees.
+- **Translation error:** Euclidean camera-frame error in centimetres.
+- **Success criterion:** rotation $\leq5°$ and translation $\leq1$ cm.
 
-| Experiment | Method | Pass Rate | Avg Rot Err | Avg Trans Err | Key Finding |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Baseline** | **PointNet Only** | 72.26% | 4.70° | 0.47 cm | Strong baseline. PointNet learns good global pose features but lacks fine geometric precision. |
-| **Ours** | **PointNet + ICP** | **90.86%** | **3.25°** | **0.19 cm** | **Best configuration.** Robust 3-stage ICP refines PointNet predictions, correcting small misalignments and boosting pass rate significantly. |
+The notebook evaluates PointNet-only and PointNet+ICP on exactly the same instances, exports one row per scene-object pair, and visualizes the hardest scenes side by side. In ICP-improvement examples, ground truth is dark green, PointNet is orange-red, and ICP is bright green, intentionally making the GT/ICP relationship easy to compare. The plots include PointNet-to-ICP rotation and translation errors. The 3D overlay is interactive: the observed cloud is rendered once with all three bounding-box wireframes, and can be freely rotated and zoomed in the notebook.
 
-### Analysis
+## 6. Latest Validated Baseline Results
 
-1.  **Impact of ICP Refinement**: The significant improvement in pass rate (from 72.26% to 90.86%) and reduction in errors demonstrates the effectiveness of the geometric refinement stage. While PointNet provides a strong initial pose estimate, it is limited by the resolution of the input point cloud and the global nature of the feature aggregation.
-2.  **Precision vs. Recall**: The ICP stage acts as a local optimizer that "snaps" the model to the observation. This is particularly effective for correcting small translational drifts (reducing error from 0.47cm to 0.19cm) and fine-tuning the rotation (reducing error from 4.70° to 3.25°).
+The most recent full validation run used the corrected validation cache and evaluated 1,705 valid object instances across 236 scenes.
 
-## 3. Test Set Evaluation (No Ground Truth)
+| Method | Mean rotation error | Mean translation error |
+|---|---:|---:|
+| PointNet | 3.57° | 0.21 cm |
+| PointNet + three-stage ICP | **2.73°** | **0.19 cm** |
 
-Since the test set does not contain ground truth poses, we cannot compute the standard Rotation/Translation errors. Instead, we evaluate the quality of our predictions using **ICP-based proxy metrics**.
+ICP reduced mean rotation error by 0.84° (about 24%) and translation error by 0.02 cm (about 10%). Translation is already strong; residual failures are expected to be dominated by ambiguous rotation, limited visible geometry, and occlusion.
 
-### 3.1 Metrics
-*   **ICP Fitness**: The ratio of target points that have a corresponding source point within the inlier threshold.
-    *   Range: $[0, 1]$. Higher is better.
-    *   Interpretation: Measures how much of the visible object surface is "explained" by our model pose.
-*   **ICP RMSE (Root Mean Squared Error)**: The average distance between matched point pairs (inliers only).
-    *   Range: $[0, \infty)$. Lower is better.
-    *   Interpretation: Measures the "tightness" of the fit. A low RMSE (< 2mm) indicates that the aligned surfaces are virtually indistinguishable.
+These numbers are the established baseline checkpoint results. They were recorded **before retraining with the new partial-view augmentation and before a new full evaluation of the guarded-ICP code**. Future report updates must list those experiments separately rather than treating them as measured improvements.
 
-### 3.2 Quantitative Results
-We evaluated the full test set (1492 objects). Below is a sample of the results:
+## 7. Planned Ablation Study
 
-| Object Name | Avg Fitness | Avg RMSE (m) | Interpretation |
-| :--- | :--- | :--- | :--- |
-| **tuna_fish_can** | 0.4030 | 0.0016 | **Excellent**. High fitness (for single view) and very tight fit. |
-| **sugar_box** | 0.3360 | 0.0016 | **Excellent**. Box shapes align well. |
-| **bleach_cleanser** | 0.1283 | 0.0009 | **Good**. Low fitness due to occlusion/viewpoint, but extremely low RMSE (sub-millimeter accuracy). |
-| **a_lego_duplo** | 0.0314 | 0.0002 | **Challenging**. Very small object, likely few points, but the few points matched are perfect. |
+All ablations will use the same corrected validation split and report mean/median rotation and translation errors, 5°/1 cm success rate, per-object results, and per-scene results.
 
-**Overall Analysis**:
-The consistently low RMSE values (~1.6mm) across the dataset confirm that our **3-Stage ICP** pipeline successfully refines the PointNet initialization to the surface of the observed point clouds. The variation in Fitness is largely due to the single-view nature of the data (we only see the front of the object).
+| Experiment | Status | Purpose |
+|---|---|---|
+| PointNet | Completed baseline | Learned coarse pose only |
+| PointNet + ICP | Completed baseline | Measure geometric local refinement |
+| PointNet + guarded ICP | Pending evaluation | Measure whether confidence gating prevents ICP regressions |
+| PointNet + quarter-turn ICP fallback | Pending evaluation | Recover geometrically supported upright-versus-sideways failures without retraining |
+| PointNet with partial-view + 90°/180° orientation augmentation + guarded ICP | Pending retraining/evaluation | Target occlusion, side-lying, and flipped-orientation failures |
+| PointNet++ | Future ablation | Test whether local hierarchical features improve partial-object pose estimation |
 
-## 4. Implementation & Optimization Tricks
+## 8. Implementation Notes
 
-To achieve high performance and efficiency, we implemented several engineering optimizations:
+- PointNet inference can run on GPU when available; Open3D ICP runs on CPU.
+- ICP samples are processed with a thread pool and canonical object point clouds are cached to avoid repeated mesh loading.
+- The test set has no ground-truth poses. It is used for qualitative box overlays and ICP proxy diagnostics only, not rotation/translation accuracy claims.
+- Pipeline inference lives in `test_inference.py`; per-instance diagnostics live in `error_analysis.py`; reusable labelled-evaluation workflows live in `evaluation_workflows.py`; and all 2D/interactive-3D rendering lives in `pose_visualization.py`. The notebook section beginning at **ICP** is intentionally limited to concise orchestration cells.
+- The notebook has one shared `CHECKPOINT_PATH` variable and a guarded **Train a new checkpoint** cell. Validation, level-2, and test inference all use that same selected checkpoint.
+- Training exposes live batch-level loss bars and an epoch-level summary bar; notebook training runs in the active kernel so progress renders directly in the notebook output. It uses the current `torch.amp.autocast` API when CUDA is active.
+- GPU transfer uses pinned-memory non-blocking copies, cuDNN benchmarking, and high-precision matrix-multiplication settings. The notebook's next-run defaults use a 256-sample batch and 12 data-loader workers to better utilize the RTX 4090.
+- The notebook includes a one-time CUDA PyTorch setup cell. Training explicitly stops if CUDA is requested but unavailable, avoiding an accidental CPU-only run.
+- Training writes TensorBoard summaries under `runs/`; the notebook dashboard resolves that directory absolutely and refreshes live loss and pose-error curves every five seconds.
+- Cache generation exposes a named live progress bar with throughput and point-count diagnostics, and safely resumes by skipping existing completed sample files.
+- The original training cache stores one compressed NPZ per object, causing repeated small-file and decompression overhead under Windows workers. An optional packed memory-mapped cache now stores contiguous file-backed arrays plus point offsets. Workers map the same OS-managed pages while preserving per-epoch random sampling and augmentation, reducing I/O without duplicating the entire cache per worker.
+- The notebook includes a nightly fine-tuning mode. It initializes a separate checkpoint from the completed best model, resets optimizer/scheduler state, and performs a new 400-epoch cosine schedule at a lower $10^{-4}$ learning rate. The initial checkpoint is retained as the first candidate, so fine-tuning cannot leave the chosen output path without a usable model.
+- Fine-tuning additionally saves a checkpoint every 25 epochs. This is necessary for targeted experiments: a model that improves rare laid-down or heavily occluded objects can slightly worsen the global validation average, so it would otherwise be discarded by best-global-loss-only selection. Snapshot models are evaluated separately on the predefined hard-scene subset.
 
-### 4.1 Parallel ICP Execution
-ICP is a CPU-bound iterative process. Running it sequentially for 1500 objects would take ~45 minutes.
-*   **Solution**: We used Python's `concurrent.futures.ThreadPoolExecutor` to parallelize the ICP refinement.
-*   **Result**: Reduced inference time from ~45 mins to **~2 minutes** on an 8-core CPU.
+## 9. Next Step
 
-### 4.2 Canonical Model Caching
-Loading and sampling the `.dae` mesh for every single sample is I/O intensive and redundant.
-*   **Solution**: We implemented a global thread-safe cache (`_canonical_model_cache`) that stores the downsampled Open3D PointCloud for each object class (and scale).
-*   **Result**: Eliminated redundant mesh parsing, significantly speeding up the worker threads.
-
-### 4.3 Robust Preprocessing
-*   **Min Valid Points Filter**: We filter out objects with fewer than 50 valid points. These are usually heavily occluded or edge artifacts where pose estimation is ill-defined.
-*   **Normal Orientation**: We explicitly orient target normals towards the camera (`target_pcd.orient_normals_towards_camera_location`). This is crucial for Point-to-Plane ICP, which relies on the dot product of the normal and the error vector. Without this, normals on the "inside" of the object would cause the optimization to push the model *away* instead of pulling it *in*.
-
-## Conclusion
-
-We have successfully developed a robust 6D pose estimation system. By combining the global search capability of a neural network (**PointNet**) with the precise local refinement of **Multi-Stage ICP**, we achieved a **90.86% pass rate** on the validation set. Our ablation studies confirm that both components are necessary: PointNet provides the coarse pose that prevents ICP from getting stuck in local minima, while the 3-stage ICP refinement corrects the residual errors to achieve high-precision alignment.
-
-On the **Test Set**, where ground truth is unavailable, our proxy metrics (ICP Fitness and RMSE) indicate high-quality alignments with sub-millimeter residual errors (~1.6mm RMSE) for most objects. The system is efficient, processing the entire test set in under 3 minutes thanks to parallelization and caching.
-
-## Visualizations
-
-Visualizations of the results (projected 3D bounding boxes) are generated in the `output_images/pointnet_icp/` directory.
-*   **Green Box**: Final Prediction (ICP Refined).
-*   **Red Box**: Initial Prediction (PointNet).
-*   **Blue Box**: Ground Truth (Validation only).
-
-The visual results confirm the quantitative metrics: the Green boxes consistently snap tightly to the object boundaries, correcting the slight misalignments of the Red boxes.
-
-### Challenging Scene: Small Object (Lego Duplo)
-The `a_lego_duplo` is particularly difficult due to its small size and symmetry. Despite sparse points, the ICP refinement (Green) successfully aligns with the object.
-
-![Lego Duplo Result](assets/1-19-1.png)
-
-### Robust Alignment: Occluded Object (Bleach Cleanser)
-Even with partial occlusion, the system recovers the correct 6D pose.
-
-![Bleach Cleanser Result](assets/1-20-8.png)
-
-### Test Set Prediction (Unseen Data)
-The following result is from the held-out test set, where no ground truth was available during training or validation. The tight bounding box alignment indicates successful generalization.
-
-![Test Set Result](assets/2-50-1.png)
+Retrain PointNet with partial-view augmentation, then rerun the full validation and error-report notebook cells. The new results should be compared directly with the baseline table above, especially on the worst scenes and object classes.

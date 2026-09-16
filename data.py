@@ -7,6 +7,7 @@ import pickle
 import open3d as o3d
 from tqdm import tqdm
 import pandas as pd
+from fast_cache import mmap_cache_dir, mmap_cache_is_valid
 
 def get_split_files(split_name, data_dir, split_dir):
     with open(os.path.join(split_dir, f"{split_name}.txt"), 'r') as f:
@@ -23,6 +24,7 @@ class PoseDataset(Dataset):
         self.split_name = split_name
         self.rgb_files, self.depth_files, self.label_files, self.meta_files = \
             get_split_files(split_name, data_dir, split_dir)
+        self.data_dir = data_dir
         self.num_points = num_points
 
         # Load object info table
@@ -107,13 +109,61 @@ class PoseDataset(Dataset):
 
         print(f"Final samples: {len(self.samples)} visible objects.")
 
+        # Optional packed cache: workers lazily memory-map the same file-backed
+        # arrays instead of opening one compressed NPZ file per requested object.
+        self.use_mmap_cache = self.use_preprocessed and mmap_cache_is_valid(
+            self.data_dir, split_name, len(self.samples)
+        )
+        self.mmap_dir = mmap_cache_dir(self.data_dir, split_name)
+        self._mmap_arrays = None
+        if self.use_mmap_cache:
+            print(f"Using shared memory-mapped cache from {self.mmap_dir}")
+
     def __len__(self):
         return len(self.samples)
+
+    def _open_mmap_cache(self):
+        """Open maps lazily inside each spawned Windows worker."""
+        if self._mmap_arrays is None:
+            names = (
+                "offsets", "points", "colors", "normals", "gt_R",
+                "gt_t_residual", "centroid", "obj_id", "sym", "dims",
+                "scale", "K", "rgb_path",
+            )
+            self._mmap_arrays = {
+                name: np.load(self.mmap_dir / f"{name}.npy", mmap_mode="r")
+                for name in names
+            }
+        return self._mmap_arrays
 
     def __getitem__(self, idx):
         scene_idx, obj_id = self.samples[idx]
         
-        if self.use_preprocessed:
+        if self.use_mmap_cache:
+            cache = self._open_mmap_cache()
+            start, end = cache["offsets"][idx:idx + 2]
+            pts = cache["points"][start:end]
+            colors = cache["colors"][start:end]
+            normals = cache["normals"][start:end]
+            # Metadata is later converted to tensors.  Copy these small arrays
+            # so PyTorch never receives a read-only memory-map view.
+            gt_R = cache["gt_R"][idx].copy()
+            gt_t_residual = cache["gt_t_residual"][idx].copy()
+            centroid = cache["centroid"][idx].copy()
+            sym = str(cache["sym"][idx])
+            dims = cache["dims"][idx].copy()
+            scale = cache["scale"][idx].copy()
+            K = cache["K"][idx].copy()
+            rgb_path = str(cache["rgb_path"][idx])
+            valid_points_count = len(pts)
+
+            N = len(pts)
+            idxs = np.random.choice(N, self.num_points, replace=N < self.num_points)
+            pts = pts[idxs]
+            colors = colors[idxs]
+            normals = normals[idxs]
+
+        elif self.use_preprocessed:
             # Load from .npz
             # The preprocess script saved files as {i:06d}.npz where i is the index in self.samples
             # Wait, the preprocess script iterated over dataset.samples.
@@ -273,10 +323,84 @@ class PoseDataset(Dataset):
 
         # Augmentation for training
         if self.split_name == 'train':
-            # 1. Jitter
+            # 1. Partial-view augmentation.  Real test crops can contain only the
+            # visible side of an object because of scene occlusion.  Hide one
+            # contiguous side of the centred cloud, then re-centre it around the
+            # new visible-cloud centroid.  Translation must use that same centroid
+            # convention or this augmentation would teach an inconsistent target.
+            if np.random.rand() < 0.65:
+                view_axis = np.random.randint(0, 3)
+                keep_fraction = np.random.uniform(0.55, 0.90)
+                cut_value = np.quantile(pts[:, view_axis], 1.0 - keep_fraction)
+                keep = pts[:, view_axis] >= cut_value
+
+                # A degenerate crop is not useful; retain the original cloud.
+                if np.count_nonzero(keep) >= 64:
+                    pts = pts[keep]
+                    colors = colors[keep]
+                    normals = normals[keep]
+
+                    # Points are currently expressed relative to the original
+                    # centroid.  Move the crop to its own centroid and update both
+                    # the absolute centroid and the corresponding pose residual.
+                    crop_offset = np.mean(pts, axis=0)
+                    pts = pts - crop_offset
+                    centroid = centroid + crop_offset
+                    gt_t_residual = gt_t_residual - crop_offset
+
+                    resample = np.random.choice(len(pts), self.num_points,
+                                                replace=len(pts) < self.num_points)
+                    pts = pts[resample]
+                    colors = colors[resample]
+                    normals = normals[resample]
+
+            # 2. Small sensor-noise augmentation.  Keep it after the centroid
+            # update so random zero-mean jitter does not alter the pose target.
             pts = pts + np.random.normal(0, 0.002, pts.shape)
             
-            # 2. Random Rotation (Perturbation +/- 30 deg)
+            # 3. Targeted large-orientation augmentation. Several difficult
+            # validation examples contain containers resting on their sides or
+            # flipped, while the data is otherwise dominated by upright poses.
+            # The camera-axis rotations below are applied consistently to the
+            # cloud, normals, rotation target, and translation residual. This
+            # deliberately enriches those rare orientations without relying on
+            # an unreliable per-object definition of "up" in mesh coordinates.
+            laydown_rotation = np.eye(3)
+            orientation_draw = np.random.rand()
+            if orientation_draw < 0.50:
+                quarter_turn = np.random.choice((-np.pi / 2, np.pi / 2))
+                if np.random.rand() < 0.5:
+                    laydown_rotation = np.array([
+                        [1, 0, 0],
+                        [0, np.cos(quarter_turn), -np.sin(quarter_turn)],
+                        [0, np.sin(quarter_turn), np.cos(quarter_turn)],
+                    ])
+                else:
+                    laydown_rotation = np.array([
+                        [np.cos(quarter_turn), 0, np.sin(quarter_turn)],
+                        [0, 1, 0],
+                        [-np.sin(quarter_turn), 0, np.cos(quarter_turn)],
+                    ])
+            elif orientation_draw < 0.65:
+                # A rarer half turn covers flipped poses such as 2-77-11.  Its
+                # horizontal axis is chosen at random for the same camera-frame
+                # convention as the quarter-turn cases.
+                half_turn = np.pi
+                if np.random.rand() < 0.5:
+                    laydown_rotation = np.array([
+                        [1, 0, 0],
+                        [0, np.cos(half_turn), -np.sin(half_turn)],
+                        [0, np.sin(half_turn), np.cos(half_turn)],
+                    ])
+                else:
+                    laydown_rotation = np.array([
+                        [np.cos(half_turn), 0, np.sin(half_turn)],
+                        [0, 1, 0],
+                        [-np.sin(half_turn), 0, np.cos(half_turn)],
+                    ])
+
+            # 4. Small viewpoint perturbation (+/- 30 deg), applied in addition
+            # to the occasional quarter-turn augmentation above.
             ang_x = np.random.uniform() * np.pi/3 - np.pi/6
             ang_y = np.random.uniform() * np.pi/3 - np.pi/6
             ang_z = np.random.uniform() * np.pi/3 - np.pi/6
@@ -285,7 +409,7 @@ class PoseDataset(Dataset):
             Ry = np.array([[np.cos(ang_y), 0, np.sin(ang_y)], [0, 1, 0], [-np.sin(ang_y), 0, np.cos(ang_y)]])
             Rz = np.array([[np.cos(ang_z), -np.sin(ang_z), 0], [np.sin(ang_z), np.cos(ang_z), 0], [0, 0, 1]])
             
-            R_aug = Rz @ Ry @ Rx
+            R_aug = laydown_rotation @ Rz @ Ry @ Rx
             
             pts = pts @ R_aug.T
             normals = normals @ R_aug.T

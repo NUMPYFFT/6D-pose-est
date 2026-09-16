@@ -4,13 +4,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
+# ``tqdm.notebook`` can be left half-initialized when VS Code interrupts a cell.
+# The standard renderer is stable in VS Code's notebook output and terminals.
 from tqdm import tqdm
 from collections import Counter
 import cv2
 import utils
 import loss as loss_utils
 from data import PoseDataset
-from model import PointNet, DGCNN
+from model import PointNet
 import config
 
 def train_one_epoch(model, loader, opt, device, args, pm_loss_fn, l1_loss_fn):
@@ -20,17 +22,18 @@ def train_one_epoch(model, loader, opt, device, args, pm_loss_fn, l1_loss_fn):
     total_geo_loss = 0
     total_trans_loss = 0
     
-    for batch in tqdm(loader, desc="Train"):
-        pts = batch['points'].to(device)
-        gt_R = batch['gt_rot'].to(device)
-        gt_t = batch['gt_t_residual'].to(device)
-        obj_id = batch['obj_id'].to(device)
+    train_bar = tqdm(loader, desc="Train batches", unit="batch", leave=False, dynamic_ncols=True)
+    for batch in train_bar:
+        pts = batch['points'].to(device, non_blocking=True)
+        gt_R = batch['gt_rot'].to(device, non_blocking=True)
+        gt_t = batch['gt_t_residual'].to(device, non_blocking=True)
+        obj_id = batch['obj_id'].to(device, non_blocking=True)
         sym = batch['sym_str']
         xyz = pts[:,:,:3]
 
         opt.zero_grad()
 
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
             pred_rot6d, pred_t = model(pts, obj_id)
             pred_R = utils.rotation_6d_to_matrix(pred_rot6d)
 
@@ -47,6 +50,7 @@ def train_one_epoch(model, loader, opt, device, args, pm_loss_fn, l1_loss_fn):
         total_pm_loss += loss_pm.item()
         total_geo_loss += loss_geo.item()
         total_trans_loss += loss_t.item()
+        train_bar.set_postfix(loss=f"{loss.item():.4f}")
 
     avg_loss = total_loss / len(loader)
     avg_pm = total_pm_loss / len(loader)
@@ -67,11 +71,12 @@ def validate(model, loader, device, args, pm_loss_fn, l1_loss_fn):
     val_count = 0
     
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Validation"):
-            pts = batch['points'].to(device)
-            gt_R = batch['gt_rot'].to(device)
-            gt_t = batch['gt_t_residual'].to(device)
-            obj_id = batch['obj_id'].to(device)
+        validation_bar = tqdm(loader, desc="Validation batches", unit="batch", leave=False, dynamic_ncols=True)
+        for batch in validation_bar:
+            pts = batch['points'].to(device, non_blocking=True)
+            gt_R = batch['gt_rot'].to(device, non_blocking=True)
+            gt_t = batch['gt_t_residual'].to(device, non_blocking=True)
+            obj_id = batch['obj_id'].to(device, non_blocking=True)
             sym = batch['sym_str']
             valid_points = batch['valid_points']
             xyz = pts[:,:,:3]
@@ -110,6 +115,7 @@ def validate(model, loader, device, args, pm_loss_fn, l1_loss_fn):
             val_trans_error_sum += trans_dist.sum().item()
             
             val_count += batch_size
+            validation_bar.set_postfix(loss=f"{loss.item():.4f}")
 
     if val_count == 0:
         return 0, 0, 0, 0, 0, 0
@@ -124,6 +130,23 @@ def validate(model, loader, device, args, pm_loss_fn, l1_loss_fn):
     
     return avg_loss, avg_pm, avg_geo, avg_trans, avg_rot_error_deg, avg_trans_error_cm
 
+
+def checkpoint_payload(model, optimizer, scheduler, epoch_idx, best_val_loss, args,
+                       val_loss=None, val_rot_error=None, val_trans_error=None):
+    """Create a self-contained checkpoint for best-model and periodic snapshots."""
+    return {
+        'epoch': epoch_idx,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'val_loss': val_loss,
+        'val_rot_error_deg': val_rot_error,
+        'val_trans_error_cm': val_trans_error,
+        'fine_tune_from': args.init_checkpoint,
+        'fine_tune_epochs_completed': epoch_idx + 1 if args.init_checkpoint else None,
+    }
+
 def train():
     args = config.get_config()
     
@@ -132,7 +155,17 @@ def train():
     # Save config
     os.makedirs(args.output_dir, exist_ok=True)
         
-    DEVICE = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested but is unavailable. Install a CUDA-enabled PyTorch build "
+            "or run explicitly with --device cpu. Training is stopped to avoid an "
+            "unexpected CPU-only run."
+        )
+    DEVICE = torch.device(args.device)
+    print(f"Training device: {DEVICE}")
+    if DEVICE.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     # 1. Setup Datasets
     train_dataset = PoseDataset("train", args.training_data_dir, args.split_dir, num_points=args.num_points, subset_size=None)
@@ -152,10 +185,17 @@ def train():
 
     # 2. Setup Model
     print(f"Using Model: {args.model}")
-    if args.model == 'pointnet':
-        model = PointNet(num_classes=args.num_classes).to(DEVICE)
-    elif args.model == 'dgcnn':
-        model = DGCNN(num_classes=args.num_classes).to(DEVICE)
+    model = PointNet(num_classes=args.num_classes).to(DEVICE)
+
+    initial_checkpoint = None
+    if args.init_checkpoint:
+        if not os.path.isfile(args.init_checkpoint):
+            raise FileNotFoundError(f"Initial checkpoint was not found: {args.init_checkpoint}")
+        if os.path.abspath(args.init_checkpoint) == os.path.abspath(args.checkpoint_path):
+            raise ValueError("--init_checkpoint and --checkpoint_path must be different files.")
+        initial_checkpoint = torch.load(args.init_checkpoint, map_location=DEVICE)
+        model.load_state_dict(initial_checkpoint["model_state_dict"])
+        print(f"Fine-tuning from: {args.init_checkpoint}")
     
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-5)
@@ -169,6 +209,9 @@ def train():
         for key, value in vars(args).items():
             f.write(f"{key}: {value}\n")
 
+    # For fine-tuning, the source model is already the initial best candidate.
+    # Saving it to the new path ensures that the output remains a valid checkpoint
+    # even when no later epoch improves validation loss.
     best_val_loss = float('inf')
     save_path = args.checkpoint_path
     
@@ -177,39 +220,66 @@ def train():
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-    for epoch in range(args.epochs):
+    if initial_checkpoint is not None:
+        best_val_loss = initial_checkpoint.get('best_val_loss', float('inf'))
+        torch.save(checkpoint_payload(
+            model, opt, scheduler, initial_checkpoint.get('epoch', -1),
+            best_val_loss, args,
+        ), save_path)
+        print(f"Copied initial best checkpoint to {save_path} (Val Loss {best_val_loss:.4f})")
+
+    epoch_bar = tqdm(range(1, args.epochs + 1), desc="Training epochs", unit="epoch", dynamic_ncols=True)
+    for epoch in epoch_bar:
+        epoch_idx = epoch - 1
         # Train
         t_loss, t_pm, t_geo, t_trans = train_one_epoch(model, train_loader, opt, DEVICE, args, pm_loss_fn, l1)
         
-        writer.add_scalar('Train/Loss', t_loss, epoch)
-        writer.add_scalar('Train/PM_Loss', t_pm, epoch)
-        writer.add_scalar('Train/Geo_Loss', t_geo, epoch)
-        writer.add_scalar('Train/Trans_Loss', t_trans, epoch)
+        writer.add_scalar('Train/Loss', t_loss, epoch_idx)
+        writer.add_scalar('Train/PM_Loss', t_pm, epoch_idx)
+        writer.add_scalar('Train/Geo_Loss', t_geo, epoch_idx)
+        writer.add_scalar('Train/Trans_Loss', t_trans, epoch_idx)
         
         scheduler.step()
         
         # Validate
         v_loss, v_pm, v_geo, v_trans, v_rot_err, v_trans_err = validate(model, val_loader, DEVICE, args, pm_loss_fn, l1)
         
-        writer.add_scalar('Val/Loss', v_loss, epoch)
-        writer.add_scalar('Val/PM_Loss', v_pm, epoch)
-        writer.add_scalar('Val/Geo_Loss', v_geo, epoch)
-        writer.add_scalar('Val/Trans_Loss', v_trans, epoch)
-        writer.add_scalar('Val/RotError', v_rot_err, epoch)
-        writer.add_scalar('Val/TransError', v_trans_err, epoch)
+        writer.add_scalar('Val/Loss', v_loss, epoch_idx)
+        writer.add_scalar('Val/PM_Loss', v_pm, epoch_idx)
+        writer.add_scalar('Val/Geo_Loss', v_geo, epoch_idx)
+        writer.add_scalar('Val/Trans_Loss', v_trans, epoch_idx)
+        writer.add_scalar('Val/RotError', v_rot_err, epoch_idx)
+        writer.add_scalar('Val/TransError', v_trans_err, epoch_idx)
 
-        print(f"Epoch {epoch+1} | Train Loss {t_loss:.4f} | Val Loss {v_loss:.4f} | Val Rot {v_rot_err:.2f} deg | Val Trans {v_trans_err:.2f} cm")
+        epoch_bar.set_postfix(
+            train_loss=f"{t_loss:.4f}",
+            val_loss=f"{v_loss:.4f}",
+            rot_deg=f"{v_rot_err:.2f}",
+            trans_cm=f"{v_trans_err:.2f}",
+        )
+
+        print(f"Epoch {epoch} | Train Loss {t_loss:.4f} | Val Loss {v_loss:.4f} | Val Rot {v_rot_err:.2f} deg | Val Trans {v_trans_err:.2f} cm")
+
+        if args.snapshot_every > 0 and epoch % args.snapshot_every == 0:
+            snapshot_dir = os.path.join(
+                checkpoint_dir or ".", "snapshots",
+                os.path.splitext(os.path.basename(save_path))[0],
+            )
+            os.makedirs(snapshot_dir, exist_ok=True)
+            snapshot_path = os.path.join(snapshot_dir, f"epoch_{epoch:04d}.pth")
+            torch.save(checkpoint_payload(
+                model, opt, scheduler, epoch_idx, best_val_loss, args,
+                val_loss=v_loss, val_rot_error=v_rot_err, val_trans_error=v_trans_err,
+            ), snapshot_path)
+            print(f"Saved periodic snapshot to {snapshot_path}")
 
         # Save Best
         if v_loss < best_val_loss:
             best_val_loss = v_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': opt.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_loss': best_val_loss
-            }, save_path)
+            torch.save(checkpoint_payload(
+                model, opt, scheduler, epoch_idx, best_val_loss, args,
+                val_loss=v_loss, val_rot_error=v_rot_err, val_trans_error=v_trans_err,
+            ), save_path)
             print(f"Saved best model to {save_path}")
 
 if __name__ == "__main__":

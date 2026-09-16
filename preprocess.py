@@ -4,6 +4,7 @@ import torch
 from PIL import Image
 import pickle
 import open3d as o3d
+# Use the stable standard renderer instead of the VS Code notebook widget.
 from tqdm import tqdm
 import argparse
 import config
@@ -22,7 +23,24 @@ def preprocess_dataset(args):
     os.makedirs(output_dir, exist_ok=True)
     print(f"Saving to: {output_dir}")
     
-    for idx in tqdm(range(len(dataset))):
+    total_samples = len(dataset)
+    written = skipped = 0
+    progress = tqdm(
+        range(total_samples),
+        total=total_samples,
+        desc=f"Building {split} cache",
+        unit="sample",
+        dynamic_ncols=True,
+    )
+    for idx in progress:
+        save_path = os.path.join(output_dir, f"{idx:06d}.npz")
+        # Safe resume support: completed samples do not need to be rebuilt.
+        if os.path.exists(save_path):
+            skipped += 1
+            if idx % 100 == 0:
+                progress.set_postfix(written=written, existing=skipped)
+            continue
+
         scene_idx, obj_id = dataset.samples[idx]
         
         # Load images
@@ -126,7 +144,6 @@ def preprocess_dataset(args):
         rgb_path = dataset.rgb_files[scene_idx]
 
         # Save to NPZ
-        save_path = os.path.join(output_dir, f"{idx:06d}.npz")
         np.savez_compressed(save_path, 
                             points=pts, 
                             colors=colors, 
@@ -140,6 +157,10 @@ def preprocess_dataset(args):
                             scale=scale, 
                             K=K, 
                             rgb_path=rgb_path)
+        written += 1
+        progress.set_postfix(written=written, existing=skipped, valid_pts=len(pts))
+
+    print(f"Cache ready: {written} built, {skipped} already present, {total_samples} total.")
 
 if __name__ == "__main__":
     args = config.get_config()

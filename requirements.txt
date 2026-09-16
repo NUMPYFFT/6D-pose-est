@@ -8,3 +8,6 @@ open3d
 trimesh
 matplotlib
 Pillow
+notebook
+tensorboard
+pycollada

@@ -3,6 +3,40 @@ import torch
 import pandas as pd
 import itertools
 
+# Hard-coded symmetry table: do NOT read geometric_symmetry from objects_v1.csv, since that
+# column can be wrong (verified case: g_lego_duplo is annotated 'no' but is empirically
+# z2-symmetric -- see notebook ICP analysis). Values below start from the CSV's published
+# labels and are the single source of truth for scoring; only entries manually visually
+# confirmed as wrong get overridden (currently just g_lego_duplo).
+OBJECT_SYMMETRY_TABLE = {
+    'a_cups': 'zinf', 'a_lego_duplo': 'z2', 'a_toy_airplane': 'no', 'adjustable_wrench': 'no',
+    'b_cups': 'zinf', 'b_lego_duplo': 'z4', 'b_toy_airplane': 'no', 'banana': 'y2',
+    'bleach_cleanser': 'z2', 'bowl': 'zinf', 'bowl_a': 'zinf', 'c_cups': 'zinf',
+    'c_lego_duplo': 'z2', 'c_toy_airplane': 'zinf', 'cracker_box': 'z2|x2', 'cup_small': 'zinf',
+    'd_cups': 'zinf', 'd_lego_duplo': 'no', 'd_toy_airplane': 'zinf', 'e_cups': 'zinf',
+    'e_lego_duplo': 'z2', 'e_toy_airplane': 'z2', 'extra_large_clamp': 'x2', 'f_cups': 'zinf',
+    'f_lego_duplo': 'z4', 'flat_screwdriver': 'xinf', 'foam_brick': 'z2|x4|y2', 'fork': 'x2',
+    'g_cups': 'zinf',
+    'g_lego_duplo': 'z2',  # override: CSV says 'no', verified empirically z2-symmetric
+    'gelatin_box': 'z2|x2', 'h_cups': 'zinf', 'hammer': 'no', 'i_cups': 'zinf', 'j_cups': 'zinf',
+    'jenga': 'z2|x2', 'knife': 'no', 'large_clamp': 'x2', 'large_marker': 'zinf',
+    'master_chef_can': 'zinf|x2', 'medium_clamp': 'x2', 'mug': 'no', 'mustard_bottle': 'z2',
+    'nine_hole_peg_test': 'no', 'pan_tefal': 'zinf', 'phillips_screwdriver': 'xinf',
+    'pitcher_base': 'no', 'plate': 'zinf', 'potted_meat_can': 'z2|x2', 'power_drill': 'no',
+    'prism': 'z2', 'pudding_box': 'z2|x2', 'rubiks_cube': 'z4|x4|y4', 'scissors': 'no',
+    'spoon': 'x2', 'sugar_box': 'z2|x2', 'tomato_soup_can': 'zinf|x2', 'tuna_fish_can': 'zinf|x2',
+    'wood_block': 'z2|y2|x4', 'pigeon': 'z2', 'pure_zhen': 'zinf|x2', 'realsense_box': 'z2|x2',
+    'pepsi': 'zinf|x2', 'green_arrow': 'zinf', 'red_car': 'no', 'conditioner': 'z2',
+    'correction_fuid': 'z2|x2', 'wooden_puzzle1': 'x4|y4|z4', 'wooden_puzzle2': 'x4|y4|z4',
+    'green_car': 'no', 'redbull': 'zinf|x2', 'doraemon_cup': 'zinf', 'doraemon_bowl': 'no',
+    'hello_kitty_cup': 'zinf', 'hello_kitty_bowl': 'no', 'hello_kitty_plate': 'z2',
+    'doraemon_spoon': 'no', 'tea_can1': 'zinf|x2', 'wooden_puzzle3': 'x4|y4|z4',
+}
+
+def get_object_symmetry(obj_name):
+    """Look up an object's symmetry class from the hard-coded table (not objects_v1.csv)."""
+    return OBJECT_SYMMETRY_TABLE.get(str(obj_name).lower(), 'no')
+
 # --- Symmetry Utils ---
 def get_rotation_matrix(axis, angle):
     axis = np.asarray(axis)
@@ -109,6 +143,38 @@ def compute_symmetry_aware_loss(R_pred, R_gt, sym_str):
             losses.append(np.degrees(angle))
             
     return min(losses) if losses else 0.0
+
+def compute_auto_symmetry_rot_error(R_pred, R_gt, discrete_orders=(2, 3, 4, 6), continuous_steps=72):
+    """
+    Rotation error that does NOT trust any per-object symmetry annotation (e.g. objects_v1.csv),
+    since those labels can be wrong. Instead it brute-forces a fixed library of candidate
+    symmetry rotations (discrete 2/3/4/6-fold and continuous, about each of x/y/z, plus a
+    180-deg flip stacked on top for box/brick-like shapes) and returns the smallest resulting
+    error. If the raw (identity) error is large (e.g. ~90/180 deg) but this returns a small
+    value, the object is empirically symmetric regardless of what any metadata file claims.
+    """
+    axes = {'x': np.array([1., 0., 0.]), 'y': np.array([0., 1., 0.]), 'z': np.array([0., 0., 1.])}
+
+    candidates = [np.eye(3)]
+    for axis in axes.values():
+        for order in discrete_orders:
+            for k in range(1, order):
+                candidates.append(get_rotation_matrix(axis, 2 * np.pi * k / order))
+        for k in range(1, continuous_steps):
+            candidates.append(get_rotation_matrix(axis, 2 * np.pi * k / continuous_steps))
+
+    flip_x180 = get_rotation_matrix(axes['x'], np.pi)
+    flip_y180 = get_rotation_matrix(axes['y'], np.pi)
+    candidates += [R_sym @ flip_x180 for R_sym in candidates] + [R_sym @ flip_y180 for R_sym in candidates]
+
+    best_err = 180.0
+    for R_sym in candidates:
+        R_gt_sym = R_gt @ R_sym
+        trace = np.trace(R_pred.T @ R_gt_sym)
+        angle = np.degrees(np.arccos(np.clip(0.5 * (trace - 1), -1.0, 1.0)))
+        if angle < best_err:
+            best_err = angle
+    return best_err
 
 # --- Loss Functions ---
 

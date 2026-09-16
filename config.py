@@ -4,7 +4,7 @@ def get_config(args=None):
     parser = argparse.ArgumentParser(description="6D Pose Estimation Configuration")
 
     # Model
-    parser.add_argument("--model", type=str, default="pointnet", choices=["pointnet", "dgcnn"], help="Model architecture")
+    parser.add_argument("--model", type=str, default="pointnet", choices=["pointnet"], help="Model architecture")
     parser.add_argument("--num_points", type=int, default=1024, help="Number of points to sample")
     parser.add_argument("--num_classes", type=int, default=79, help="Number of object classes")
 
@@ -14,6 +14,11 @@ def get_config(args=None):
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=400, help="Number of epochs")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--init_checkpoint", type=str, default=None,
+                        help="Optional checkpoint whose model weights initialize a new training run. "
+                             "Optimizer and scheduler are intentionally reset.")
+    parser.add_argument("--snapshot_every", type=int, default=0,
+                        help="Save a periodic checkpoint every N epochs (0 disables snapshots).")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
     
     # Loss Weights
@@ -30,8 +35,8 @@ def get_config(args=None):
     parser.add_argument("--split", type=str, default="val", help="Split to evaluate on (val or test)")
 
     # Paths
-    parser.add_argument("--training_data_dir", type=str, default="./training_data_filtered/training_data/v2.2", help="Path to training data")
-    parser.add_argument("--split_dir", type=str, default="./training_data_filtered/training_data/splits/v2", help="Path to split files")
+    parser.add_argument("--training_data_dir", type=str, default=r"C:\Users\Owner\Desktop\Fall2023\CSE275\6D Pose\training_data_filtered\training_data\v2.2", help="Path to training data")
+    parser.add_argument("--split_dir", type=str, default=r"C:\Users\Owner\Desktop\Fall2023\CSE275\6D Pose\training_data_filtered\training_data\splits\v2", help="Path to split files")
     parser.add_argument("--objects_csv", type=str, default="models/objects_v1.csv", help="Path to objects CSV")
     parser.add_argument("--checkpoint_path", type=str, default="model_weights/pointnet_v2.pth", help="Path to save checkpoint")
     parser.add_argument("--output_dir", type=str, default="output_images", help="Directory for output images")
