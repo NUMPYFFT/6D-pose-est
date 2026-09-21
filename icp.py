@@ -570,7 +570,9 @@ def process_icp_sample(data):
     """
     pred_R = data['pred_R']
     pred_t = data['pred_t']
-    obs_pts = data['obs_pts']
+    # ConfidencePointNet optionally supplies a high-reliability subset for
+    # registration. Keep data['obs_pts'] untouched for metrics and plots.
+    obs_pts = data.get('icp_obs_pts', data['obs_pts'])
     obj_name = data['obj_name']
     scale = data['scale']
     icp_stages = data['icp_stages']

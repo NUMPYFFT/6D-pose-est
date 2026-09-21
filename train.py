@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 # ``tqdm.notebook`` can be left half-initialized when VS Code interrupts a cell.
@@ -9,11 +10,65 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from collections import Counter
 import cv2
-import utils
-import loss as loss_utils
-from data import PoseDataset
-from model import PointNet
-import config
+import helpers as utils
+import model as loss_utils
+from helpers import PoseDataset
+from model import build_pose_model
+import helpers as config
+
+
+def predict_pose(model, batch, points, obj_id, device, model_name):
+    """Run either the geometry-only baseline or RGB--point fusion model."""
+    if model_name == "fusion":
+        image = batch['image'].to(device, non_blocking=True)
+        pixel_coords = batch['pixel_coords'].to(device, non_blocking=True)
+        rotation, translation = model(points, obj_id, image, pixel_coords)
+        return rotation, translation, None
+    if model_name == "correspondence":
+        return model(
+            points, obj_id,
+            batch["source_points"].to(device, non_blocking=True),
+        )
+    if model_name == "multihypothesis":
+        return model(points, obj_id)
+    if model_name == "confidence":
+        return model(points, obj_id)
+    rotation, translation = model(points, obj_id)
+    return rotation, translation, None
+
+
+def multi_hypothesis_loss(auxiliary, gt_R, gt_t, sym, args):
+    """Winner-takes-best pose loss plus confidence and light diversity terms."""
+    hypothesis_rot6d = auxiliary["hypothesis_rot6d"]
+    hypothesis_t = auxiliary["hypothesis_translation"]
+    batch_size, hypothesis_count, _ = hypothesis_rot6d.shape
+    matrices = torch.stack([
+        utils.rotation_6d_to_matrix(hypothesis_rot6d[:, index])
+        for index in range(hypothesis_count)
+    ], dim=1)
+    geo = torch.stack([
+        loss_utils.symmetry_aware_geodesic_per_sample(matrices[:, index], gt_R, sym)
+        for index in range(hypothesis_count)
+    ], dim=1)
+    translation = (hypothesis_t - gt_t.unsqueeze(1)).abs().mean(dim=2)
+    candidate_error = geo + translation
+    winners = candidate_error.argmin(dim=1)
+    winner_geo = geo.gather(1, winners.unsqueeze(1)).mean()
+    winner_translation = translation.gather(1, winners.unsqueeze(1)).mean()
+    confidence_loss = F.cross_entropy(auxiliary["confidence_logits"], winners)
+
+    # Avoid all four heads collapsing to the same rotation. A modest 20-degree
+    # separation leaves room for equivalent symmetric poses.
+    diversity_terms = []
+    for left in range(hypothesis_count):
+        for right in range(left + 1, hypothesis_count):
+            relative = matrices[:, left].transpose(1, 2) @ matrices[:, right]
+            trace = relative[:, 0, 0] + relative[:, 1, 1] + relative[:, 2, 2]
+            angle = torch.acos(torch.clamp((trace - 1.0) * 0.5, -0.999, 0.999))
+            diversity_terms.append(F.relu(0.35 - angle).mean())
+    diversity_loss = torch.stack(diversity_terms).mean()
+    loss = winner_geo + winner_translation + args.w_conf * confidence_loss + args.w_diversity * diversity_loss
+    return loss, torch.zeros_like(loss), winner_geo, winner_translation
 
 def train_one_epoch(model, loader, opt, device, args, pm_loss_fn, l1_loss_fn):
     model.train()
@@ -34,14 +89,36 @@ def train_one_epoch(model, loader, opt, device, args, pm_loss_fn, l1_loss_fn):
         opt.zero_grad()
 
         with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
-            pred_rot6d, pred_t = model(pts, obj_id)
+            pred_rot6d, pred_t, auxiliary = predict_pose(model, batch, pts, obj_id, device, args.model)
             pred_R = utils.rotation_6d_to_matrix(pred_rot6d)
 
-            loss_pm = pm_loss_fn(pred_R, pred_t, gt_R, gt_t, xyz, sym)
-            loss_t = l1_loss_fn(pred_t, gt_t)
-            loss_geo = loss_utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
-
-            loss = args.w_pm * loss_pm + args.w_geo * loss_geo + args.w_trans * loss_t
+            if auxiliary is not None and "hypothesis_rot6d" in auxiliary:
+                loss, loss_pm, loss_geo, loss_t = multi_hypothesis_loss(
+                    auxiliary, gt_R, gt_t, sym, args
+                )
+            else:
+                loss_pm = pm_loss_fn(pred_R, pred_t, gt_R, gt_t, xyz, sym)
+                loss_t = l1_loss_fn(pred_t, gt_t)
+                loss_geo = loss_utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
+                loss = args.w_pm * loss_pm + args.w_geo * loss_geo + args.w_trans * loss_t
+            if auxiliary is not None and "matched_source" in auxiliary:
+                # Source-point identity is ambiguous for symmetric objects, so
+                # supervise soft source matches only on explicitly asymmetric
+                # objects. For those objects, inverse-transforming each observed
+                # point gives its canonical-coordinate target.
+                asymmetric = torch.tensor(
+                    [str(value).strip().lower() == "no" for value in sym],
+                    device=device, dtype=torch.bool,
+                )
+                if asymmetric.any():
+                    canonical_target = torch.bmm(
+                        (xyz - gt_t.unsqueeze(1)), gt_R
+                    )
+                    corr_loss = F.smooth_l1_loss(
+                        auxiliary["matched_source"][asymmetric],
+                        canonical_target[asymmetric],
+                    )
+                    loss = loss + args.w_corr * corr_loss
         
         loss.backward()
         opt.step()
@@ -92,15 +169,40 @@ def validate(model, loader, device, args, pm_loss_fn, l1_loss_fn):
             obj_id = obj_id[mask]
             xyz = xyz[mask]
             sym = [s for i, s in enumerate(sym) if mask[i]]
+            # Fusion inputs are per-instance tensors too. Keep them aligned with
+            # the filtered point-cloud batch before sampling image features.
+            if args.model == "fusion":
+                batch["image"] = batch["image"][mask]
+                batch["pixel_coords"] = batch["pixel_coords"][mask]
+            if args.model == "correspondence":
+                batch["source_points"] = batch["source_points"][mask]
             
-            pred_rot6d, pred_t = model(pts, obj_id)
+            pred_rot6d, pred_t, auxiliary = predict_pose(model, batch, pts, obj_id, device, args.model)
             pred_R = utils.rotation_6d_to_matrix(pred_rot6d)
 
-            loss_pm = pm_loss_fn(pred_R, pred_t, gt_R, gt_t, xyz, sym)
-            loss_t = l1_loss_fn(pred_t, gt_t)
-            loss_geo = loss_utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
-            
-            loss = args.w_pm * loss_pm + args.w_geo * loss_geo + args.w_trans * loss_t
+            if auxiliary is not None and "hypothesis_rot6d" in auxiliary:
+                loss, loss_pm, loss_geo, loss_t = multi_hypothesis_loss(
+                    auxiliary, gt_R, gt_t, sym, args
+                )
+            else:
+                loss_pm = pm_loss_fn(pred_R, pred_t, gt_R, gt_t, xyz, sym)
+                loss_t = l1_loss_fn(pred_t, gt_t)
+                loss_geo = loss_utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
+                loss = args.w_pm * loss_pm + args.w_geo * loss_geo + args.w_trans * loss_t
+            if auxiliary is not None and "matched_source" in auxiliary:
+                asymmetric = torch.tensor(
+                    [str(value).strip().lower() == "no" for value in sym],
+                    device=device, dtype=torch.bool,
+                )
+                if asymmetric.any():
+                    canonical_target = torch.bmm(
+                        (xyz - gt_t.unsqueeze(1)), gt_R
+                    )
+                    corr_loss = F.smooth_l1_loss(
+                        auxiliary["matched_source"][asymmetric],
+                        canonical_target[asymmetric],
+                    )
+                    loss = loss + args.w_corr * corr_loss
             
             # Weighted by batch size for accurate average
             batch_size = pts.shape[0]
@@ -109,8 +211,15 @@ def validate(model, loader, device, args, pm_loss_fn, l1_loss_fn):
             total_geo_loss += loss_geo.item() * batch_size
             total_trans_loss += loss_t.item() * batch_size
 
-            # Metrics
-            val_geo_error_sum += loss_geo.item() * batch_size # Geo loss is in radians, convert later
+            # For multi-hypothesis training, loss_geo is the oracle best-candidate
+            # value. Report the confidence-selected hypothesis instead, matching
+            # the pose that inference will actually send to ICP.
+            metric_geo = (
+                loss_utils.symmetry_aware_geodesic_loss(pred_R, gt_R, sym)
+                if auxiliary is not None and "hypothesis_rot6d" in auxiliary
+                else loss_geo
+            )
+            val_geo_error_sum += metric_geo.item() * batch_size # radians, converted later
             trans_dist = torch.norm(pred_t - gt_t, dim=1) * 100.0 # cm
             val_trans_error_sum += trans_dist.sum().item()
             
@@ -168,24 +277,47 @@ def train():
         torch.set_float32_matmul_precision("high")
 
     # 1. Setup Datasets
-    train_dataset = PoseDataset("train", args.training_data_dir, args.split_dir, num_points=args.num_points, subset_size=None)
+    uses_image = args.model == "fusion"
+    uses_source = args.model == "correspondence"
+    train_dataset = PoseDataset(
+        "train", args.training_data_dir, args.split_dir, num_points=args.num_points,
+        subset_size=None, return_image=uses_image, image_size=args.image_size,
+        return_source=uses_source, num_source_points=args.num_source_points,
+    )
     
     print("Calculating class weights for balanced sampling...")
     train_targets = [s[1] for s in train_dataset.samples]
     class_counts = Counter(train_targets)
     class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
     sample_weights = torch.DoubleTensor([class_weights[t] for t in train_targets])
+    if args.hard_indices:
+        if not os.path.isfile(args.hard_indices):
+            raise FileNotFoundError(f"Hard-example index file was not found: {args.hard_indices}")
+        hard_indices = np.load(args.hard_indices)
+        hard_indices = np.asarray(hard_indices, dtype=np.int64)
+        hard_indices = hard_indices[(hard_indices >= 0) & (hard_indices < len(train_dataset))]
+        if len(hard_indices) == 0:
+            raise ValueError("The hard-example index file contains no valid training indices.")
+        sample_weights[torch.from_numpy(np.unique(hard_indices))] *= args.hard_replay_factor
+        print(
+            f"Hard-example replay: {len(np.unique(hard_indices))} instances weighted "
+            f"{args.hard_replay_factor:.1f}x."
+        )
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
     print("WeightedRandomSampler initialized.")
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=True, prefetch_factor=4)
 
-    val_dataset = PoseDataset("val", args.training_data_dir, args.split_dir, num_points=args.num_points, subset_size=None)
+    val_dataset = PoseDataset(
+        "val", args.training_data_dir, args.split_dir, num_points=args.num_points,
+        subset_size=None, return_image=uses_image, image_size=args.image_size,
+        return_source=uses_source, num_source_points=args.num_source_points,
+    )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, persistent_workers=True)
 
     # 2. Setup Model
     print(f"Using Model: {args.model}")
-    model = PointNet(num_classes=args.num_classes).to(DEVICE)
+    model = build_pose_model(args.model, num_classes=args.num_classes).to(DEVICE)
 
     initial_checkpoint = None
     if args.init_checkpoint:
@@ -221,12 +353,16 @@ def train():
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     if initial_checkpoint is not None:
-        best_val_loss = initial_checkpoint.get('best_val_loss', float('inf'))
+        source_best_val_loss = initial_checkpoint.get('best_val_loss', float('inf'))
+        best_val_loss = float('inf') if args.reset_best_val else source_best_val_loss
         torch.save(checkpoint_payload(
             model, opt, scheduler, initial_checkpoint.get('epoch', -1),
             best_val_loss, args,
         ), save_path)
-        print(f"Copied initial best checkpoint to {save_path} (Val Loss {best_val_loss:.4f})")
+        if args.reset_best_val:
+            print(f"Copied initial checkpoint to {save_path}; selecting the best validation result from this fine-tuning run.")
+        else:
+            print(f"Copied initial best checkpoint to {save_path} (Val Loss {best_val_loss:.4f})")
 
     epoch_bar = tqdm(range(1, args.epochs + 1), desc="Training epochs", unit="epoch", dynamic_ncols=True)
     for epoch in epoch_bar:
@@ -258,8 +394,6 @@ def train():
             trans_cm=f"{v_trans_err:.2f}",
         )
 
-        print(f"Epoch {epoch} | Train Loss {t_loss:.4f} | Val Loss {v_loss:.4f} | Val Rot {v_rot_err:.2f} deg | Val Trans {v_trans_err:.2f} cm")
-
         if args.snapshot_every > 0 and epoch % args.snapshot_every == 0:
             snapshot_dir = os.path.join(
                 checkpoint_dir or ".", "snapshots",
@@ -280,7 +414,8 @@ def train():
                 model, opt, scheduler, epoch_idx, best_val_loss, args,
                 val_loss=v_loss, val_rot_error=v_rot_err, val_trans_error=v_trans_err,
             ), save_path)
-            print(f"Saved best model to {save_path}")
+
+    print(f"Training complete | best validation loss: {best_val_loss:.4f} | checkpoint: {save_path}")
 
 if __name__ == "__main__":
     train()

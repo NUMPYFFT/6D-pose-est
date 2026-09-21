@@ -2,106 +2,106 @@
 
 This project estimates an object's 6D camera-frame pose from RGB-D data, an object segmentation mask, and a canonical mesh. PointNet predicts a coarse pose; three-stage ICP refines it only when geometric checks show a meaningful improvement.
 
-The current validated baseline on the corrected validation cache contains 1,705 valid object instances across 236 scenes:
+The latest controlled ablation uses the corrected validation cache, 1,705 valid object
+instances across 236 scenes, and identical fixed point sampling for each learned model:
 
 | Method | Mean rotation error | Mean translation error |
 |---|---:|---:|
-| PointNet | 3.57° | 0.21 cm |
-| PointNet + ICP | **2.73°** | **0.19 cm** |
+| PointNet | 3.37° | 0.23 cm |
+| PointNet + guarded ICP | **2.58°** | **0.18 cm** |
+| RGB--point fusion | 3.31° | 0.25 cm |
+| RGB--point fusion + guarded ICP | 3.17° | 0.22 cm |
 
-The newly added partial-view augmentation and guarded-ICP acceptance logic still need a retraining and evaluation run before they are reported as improvements.
+PointNet + guarded ICP also has the highest 5°/1 cm success rate (95.31%), versus
+92.73% for PointNet and 91.79% for fusion + ICP. The RGB fusion initializer has a
+slightly lower mean rotation error than PointNet but a lower success rate and does not
+combine with ICP as effectively; PointNet + guarded ICP is therefore the main method.
+
+These are the recorded validation results for the retained checkpoints; they do not
+claim that every later augmentation or fine-tuning experiment improved the baseline.
 
 For methodology, results, and the experiment plan, see [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).
 
 ## Project layout
 
-```text
-config.py              Configuration and data/checkpoint paths
-data.py                RGB-D dataset loading, caching, and training augmentation
-model.py               Class-conditioned PointNet pose regressor
-loss.py                Pose and symmetry-aware losses
-icp.py                 Canonical-mesh loading and guarded three-stage ICP
-train.py               Model training with progress reporting
-preprocess.py          Train/validation/test point-cloud cache generation
-test_inference.py      Reusable labelled and test-set inference pipelines
-error_analysis.py      Per-instance, per-object, and per-scene error reports
-evaluation_workflows.py Compact labelled-evaluation and ablation workflows
-pose_visualization.py  2D, zoomed, and interactive 3D pose visualizations
-see_data.ipynb         Clean notebook orchestration and data exploration
-TECHNICAL_REPORT.md    Detailed technical report
-```
+The eight Python modules have distinct roles:
 
-## Setup
+| File | Purpose |
+|---|---|
+| `preprocess.py` | Generate per-object point-cloud caches and the optional memory-mapped cache |
+| `helpers.py` | Configuration, dataset loading, augmentation, caching, and evaluation helpers |
+| `model.py` | PointNet and experimental models, plus pose and symmetry-aware losses |
+| `train.py` | Training loop, validation, checkpoints, and TensorBoard metrics |
+| `inference.py` | Labelled/test inference, error reports, and ablation comparisons |
+| `icp.py` | Canonical-mesh registration and guarded ICP refinement |
+| `visualization.py` | Scene overlays and comparison plots |
+| `pose_pipeline.py` | Command-line entry point for the main workflows |
 
-Install the dependencies into the project environment:
+`see_data.ipynb` remains the data-exploration notebook. `pose_workflow.ipynb` is
+the compact interactive training/evaluation workflow. The methodological details
+and failure cases are in `TECHNICAL_REPORT.md`.
 
-```bash
-pip install -r requirements.txt
-```
+## Setup and commands
 
-Set the training data directory, split directory, and checkpoint path in `config.py`. The train, validation, and test caches must be built from their corresponding data roots.
-
-## Build point-cloud caches
-
-Caching performs depth back-projection, object-mask extraction, voxel downsampling, normal estimation, and metadata preparation. Run it once per split:
+Install dependencies with `pip install -r requirements.txt`. Dataset paths and
+default hyperparameters are set by `get_config()` in `helpers.py`; its dataset
+paths currently point to this project's Windows data location and may need editing
+on another machine. Run commands from the project root:
 
 ```bash
-python preprocess.py --split train
-python preprocess.py --split val
-python preprocess.py --split test
+python pose_pipeline.py preprocess --split train
+python pose_pipeline.py preprocess --split val
+python pose_pipeline.py build-cache --split train
+python pose_pipeline.py train --epochs 400 --batch_size 128
+python pose_pipeline.py evaluate
+python pose_pipeline.py ablations
+python pose_pipeline.py visualize-failure --scene 2-6-3 --object mustard_bottle
+python pose_pipeline.py visualize-icp --model pointnet
+python pose_pipeline.py infer-test --max-scenes 5
 ```
 
-Cache generation shows a live `Building <split> cache` progress bar with sample rate and valid-point count. It safely resumes: existing `.npz` files are skipped and reported in the final summary.
+Preprocessing may also be run for `--split test`. The memory-mapped cache is
+optional; it reduces repeated Windows file-open/decompression overhead. Training
+requires a CUDA-enabled PyTorch installation for practical speed. It reports
+compact epoch-level loss, rotation, and translation metrics, saves the best
+checkpoint to `model_weights/pointnet_new.pth` by default, and writes detailed
+curves to TensorBoard. This default output is separate from the reported baseline.
+Use `python pose_pipeline.py train --help` for model, checkpoint, fine-tuning,
+and data-loader options.
 
-### Optional fast training cache
-
-The regular training cache has one compressed NPZ file per object. To reduce Windows file-open and decompression overhead, pack the completed train cache into shared memory-mapped arrays once:
+To fine-tune the retained baseline without overwriting it, for example:
 
 ```bash
-python build_fast_cache.py --split train
+python pose_pipeline.py train --init_checkpoint model_weights/pointnet_occlusion_guarded_v1.pth --checkpoint_path model_weights/pointnet_finetuned_new.pth --lr 0.0001 --epochs 100
 ```
 
-This creates `preprocessed/train_mmap/`. DataLoader workers memory-map the same read-only arrays automatically, while train-time occlusion, noise, and pose augmentation remain random every epoch.
+`evaluate` uses `model_weights/pointnet_occlusion_guarded_v1.pth` by default.
+Pass `--checkpoint <path>` to evaluate another PointNet checkpoint; training a new
+checkpoint does not automatically change the evaluation default. `ablations`
+compares PointNet, PointNet + guarded ICP, RGB--point fusion, and RGB--point fusion
++ guarded ICP on the same validation instances, writing a summary and per-instance
+CSV files under `outputs/`. The visualization commands render a selected failure
+case or representative ICP improvements to `output_images/`. Test inference has no
+ground truth; it produces qualitative predictions only.
 
-## Train PointNet
+The retained checkpoints are `pointnet_occlusion_guarded_v1.pth` (reported
+baseline), `point_image_fusion_v1.pth` (RGB fusion ablation), and
+`pointnet_occlusion_guarded_nightly_ft_v2.pth` (notebook fine-tuning selection).
+The earlier nightly v1 file is still present but is not used by a current default
+command. Correspondence, confidence, and multi-hypothesis model definitions remain
+in `model.py` as negative/experimental ablations; their discarded checkpoints are
+not needed for the main workflow.
 
-The project requires CUDA-enabled PyTorch for practical training speed. In `see_data.ipynb`, run **GPU setup (one time)** once, restart the kernel, set `INSTALL_CUDA_TORCH = False`, and rerun the cell to verify that `torch.cuda.is_available()` is `True` and the RTX 4090 is detected. Training now stops with a clear error rather than silently using CPU if CUDA is unavailable.
+## Evaluate in notebooks
 
-```bash
-python train.py --epochs 400 --batch_size 128
-```
-
-Training includes jitter, partial-view cropping, small rigid pose perturbations, and targeted large orientation changes: a 90° horizontal-axis rotation with probability 0.50 plus a 180° horizontal flip with probability 0.15. These label-consistent transforms enrich side-lying and flipped poses observed in scenes such as `2-6-3` and `2-77-11`. It displays live batch-level train/validation loss bars plus an epoch-level bar with train loss, validation loss, rotation error, and translation error.
-
-The notebook's current GPU-oriented defaults use `TRAIN_BATCH_SIZE = 256` and `TRAIN_NUM_WORKERS = 12`. The larger batch improves RTX 4090 utilization and reduces the number of batches per epoch; reduce workers to 8 if the CPU becomes slower or unstable.
-
-The notebook runs training in the active kernel so its tqdm bars render live. Set `CHECKPOINT_PATH` once, change `RUN_TRAINING` to `True`, run **Train a new checkpoint**, and set it back to `False` after training. All following notebook evaluations use that same checkpoint path.
-
-### Overnight fine-tuning
-
-After a full run completes, use the notebook's **Nightly fine-tuning run** cell. It initializes a separate output checkpoint from the completed best checkpoint, resets the optimizer and cosine schedule, and trains for 400 further epochs at `1e-4` learning rate. This run includes the targeted laid-down-pose augmentation. The source checkpoint is never overwritten; the nightly output is always valid because it begins as a copy of the source model and is replaced only when validation loss improves. It also saves snapshots every 25 epochs under `model_weights/snapshots/`, allowing targeted hard-scene evaluation even when a candidate does not improve the global validation average.
-
-Run **TensorBoard training dashboard** after training begins to inspect live loss, rotation, and translation curves. It resolves the project `runs/` directory to an absolute path and refreshes every five seconds.
-
-## Evaluate and inspect predictions
-
-Open `see_data.ipynb` and run the compact section beginning at **ICP**, in order:
-
-1. **Full validation evaluation** runs PointNet and guarded ICP, then saves `outputs/val_instance_error_report.csv`.
-2. **Hard validation scenes** displays GT, PointNet, and ICP overlays.
-3. **Examples where ICP improves PointNet** selects meaningful improvements and shows full-scene, zoomed, and rotatable 3D box overlays.
-4. **Level-2 train scenes** evaluates the curated difficult scenes without training augmentation.
-5. **Test-set inference** visualizes final predictions only; test poses have no ground truth.
-
-Color convention for ICP-improvement visualizations:
-
-- Dark green: ground truth
-- Orange-red: PointNet initialization
-- Bright green: final guarded ICP pose
+Use `see_data.ipynb` to understand the RGB-D data, object masks, point-cloud
+lifting, and coordinate frames. Use `pose_workflow.ipynb` for interactive training,
+validation, hard-scene inspection, and GT/prediction overlays. Code-heavy logic
+lives in the Python modules above rather than notebook cells.
 
 ## Core behavior
 
-- PointNet accepts 1,024 point features per object: XYZ, RGB, and normals.
+- PointNet samples 1,024 points per object, with nine features per point: XYZ, RGB, and normals.
 - Rotation uses a 6D representation; translation is predicted relative to the observed-cloud centroid.
 - ICP uses point-to-plane stages at 1.0 cm and 0.5 cm, followed by point-to-point ICP at 0.25 cm.
 - ICP rejects a result that moves too far from PointNet or does not provide a meaningful fitness/RMSE improvement.

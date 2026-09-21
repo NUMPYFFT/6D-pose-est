@@ -7,8 +7,8 @@ import open3d as o3d
 # Use the stable standard renderer instead of the VS Code notebook widget.
 from tqdm import tqdm
 import argparse
-import config
-from data import PoseDataset
+import helpers as config
+from helpers import PoseDataset
 
 def preprocess_dataset(args):
     split = args.split
@@ -165,3 +165,17 @@ def preprocess_dataset(args):
 if __name__ == "__main__":
     args = config.get_config()
     preprocess_dataset(args)
+
+
+"""Command-line builder for the optional memory-mapped data cache."""
+
+import helpers as config
+from helpers import PoseDataset
+from helpers import build_mmap_cache
+
+
+def build_fast_cache_main():
+    args = config.get_config()
+    dataset = PoseDataset(args.split, args.training_data_dir, args.split_dir,
+                          num_points=args.num_points)
+    build_mmap_cache(args.training_data_dir, args.split, expected_samples=len(dataset))
