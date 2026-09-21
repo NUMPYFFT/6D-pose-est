@@ -1,4 +1,4 @@
-"""PointNet + ICP inference and visualization for the unlabelled test set."""
+"""Learned pose initialization, guarded ICP, evaluation, and test inference."""
 
 from pathlib import Path
 import os
@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 import helpers as config
 import icp
-import model as loss_utils
+import pose_losses
 import helpers as utils
 from helpers import PoseDataset
 from model import build_pose_model
@@ -32,29 +32,8 @@ def _predict_pose(model, batch, points, object_ids, device, model_name):
             batch["pixel_coords"].to(device, non_blocking=True),
         )
         return rotation, translation, None
-    if model_name == "correspondence":
-        rotation, translation, _ = model(
-            points, object_ids,
-            batch["source_points"].to(device, non_blocking=True),
-        )
-        return rotation, translation, None
-    if model_name == "multihypothesis":
-        rotation, translation, _ = model(points, object_ids)
-        return rotation, translation, None
-    if model_name == "confidence":
-        return model(points, object_ids)
     rotation, translation = model(points, object_ids)
     return rotation, translation, None
-
-
-def _confidence_icp_points(camera_points, point_attention, keep_ratio):
-    """Select high-confidence points for ICP, retaining enough geometry to be stable."""
-    if point_attention is None:
-        return camera_points
-    point_count = len(camera_points)
-    keep_count = min(point_count, max(200, int(np.ceil(point_count * keep_ratio))))
-    indices = np.argpartition(point_attention, -keep_count)[-keep_count:]
-    return camera_points[indices]
 
 
 def _scene_subset(dataset, max_scenes, scene_prefix=None):
@@ -76,14 +55,13 @@ def run_test_inference(max_scenes=5, scene_prefix=None, test_data_dir=DEFAULT_TE
                        test_split_dir=DEFAULT_TEST_SPLIT_DIR,
                        checkpoint_path=DEFAULT_CHECKPOINT, refine_with_icp=True,
                        quarter_turn_fallback=False, model_name="pointnet"):
-    """Predict test poses with PointNet and optional ICP, without GT metrics."""
+    """Predict test poses with the selected model and optional ICP, without GT metrics."""
     args = config.get_config(args=[])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     objects_df = pd.read_csv(PROJECT_ROOT / args.objects_csv)
     dataset = PoseDataset(
         "test", str(test_data_dir), str(test_split_dir), num_points=args.num_points,
         return_image=model_name == "fusion", image_size=args.image_size,
-        return_source=model_name == "correspondence", num_source_points=args.num_source_points,
     )
     indices, scene_names = _scene_subset(dataset, max_scenes, scene_prefix=scene_prefix)
     if not indices:
@@ -99,7 +77,8 @@ def run_test_inference(max_scenes=5, scene_prefix=None, test_data_dir=DEFAULT_TE
 
     samples = []
     with torch.no_grad():
-        for batch in tqdm(loader, desc="PointNet test inference", unit="batch"):
+        initializer = "RGB fusion" if model_name == "fusion" else "PointNet"
+        for batch in tqdm(loader, desc=f"{initializer} test inference", unit="batch"):
             points = batch["points"].to(device)
             object_ids = batch["obj_id"].to(device)
             rot6d, pred_t_residual, auxiliary = _predict_pose(
@@ -107,8 +86,6 @@ def run_test_inference(max_scenes=5, scene_prefix=None, test_data_dir=DEFAULT_TE
             )
             pred_Rs = utils.rotation_6d_to_matrix(rot6d).cpu().numpy()
             pred_t_residuals = pred_t_residual.cpu().numpy()
-            attention = None if auxiliary is None else auxiliary.get("point_attention")
-            attention = None if attention is None else attention.cpu().numpy()
             for i, rgb_path in enumerate(batch["rgb_path"]):
                 obj_id = batch["obj_id"][i].item()
                 with open(rgb_path.replace("_color_kinect.png", "_meta.pkl"), "rb") as handle:
@@ -121,10 +98,7 @@ def run_test_inference(max_scenes=5, scene_prefix=None, test_data_dir=DEFAULT_TE
                 samples.append({
                     "pred_R": pred_Rs[i], "pred_t": centroid + pred_t_residuals[i],
                     "obs_pts": observed_points,
-                    "icp_obs_pts": _confidence_icp_points(
-                        observed_points, None if attention is None else attention[i],
-                        args.confidence_keep_ratio,
-                    ),
+                    "icp_obs_pts": observed_points,
                     "obj_name": meta["object_names"][obj_idx], "obj_id": obj_id,
                     "scale": batch["scale"][i].numpy(), "objects_df": objects_df,
                     "icp_stages": args.icp_stages, "icp_threshold": args.icp_threshold,
@@ -132,7 +106,7 @@ def run_test_inference(max_scenes=5, scene_prefix=None, test_data_dir=DEFAULT_TE
                     "use_quarter_turn_fallback": quarter_turn_fallback,
                     "obj_dims": batch["obj_dims"][i].numpy(), "K": batch["intrinsic"][i].numpy(),
                 })
-    print(f"PointNet predicted {len(samples)} objects from {len(scene_names)} test scene(s) on {device}.")
+    print(f"{initializer} predicted {len(samples)} objects from {len(scene_names)} test scene(s) on {device}.")
     if refine_with_icp and samples:
         icp.run_icp_refinement(samples, use_icp=True)
     return samples
@@ -152,7 +126,7 @@ def run_labelled_inference(split="val", max_scenes=None, scene_prefix=None,
                            scene_names=None, checkpoint_path=DEFAULT_CHECKPOINT,
                            refine_with_icp=True, quarter_turn_fallback=False,
                            model_name="pointnet"):
-    """Evaluate PointNet, with optional ICP, against GT poses on train or validation data.
+    """Evaluate the selected initializer, with optional ICP, against labelled poses.
 
     ``scene_names`` can be a set/list loaded with :func:`load_scene_names`, which is
     useful for evaluating a curated level-2 subset. Train augmentation is disabled so
@@ -167,7 +141,6 @@ def run_labelled_inference(split="val", max_scenes=None, scene_prefix=None,
     dataset = PoseDataset(
         split, args.training_data_dir, args.split_dir, num_points=args.num_points,
         return_image=model_name == "fusion", image_size=args.image_size,
-        return_source=model_name == "correspondence", num_source_points=args.num_source_points,
     )
 
     # PoseDataset augments only when this attribute is literally 'train'. Its cached
@@ -202,7 +175,8 @@ def run_labelled_inference(split="val", max_scenes=None, scene_prefix=None,
 
     samples = []
     with torch.no_grad():
-        for batch in tqdm(loader, desc=f"PointNet {split} inference", unit="batch"):
+        initializer = "RGB fusion" if model_name == "fusion" else "PointNet"
+        for batch in tqdm(loader, desc=f"{initializer} {split} inference", unit="batch"):
             points = batch["points"].to(device)
             object_ids = batch["obj_id"].to(device)
             rot6d, pred_t_residual, auxiliary = _predict_pose(
@@ -211,8 +185,6 @@ def run_labelled_inference(split="val", max_scenes=None, scene_prefix=None,
             pred_Rs = utils.rotation_6d_to_matrix(rot6d).cpu().numpy()
             pred_t_residuals = pred_t_residual.cpu().numpy()
 
-            attention = None if auxiliary is None else auxiliary.get("point_attention")
-            attention = None if attention is None else attention.cpu().numpy()
             for i, rgb_path in enumerate(batch["rgb_path"]):
                 if batch["valid_points"][i].item() < args.min_valid_points:
                     continue
@@ -228,10 +200,7 @@ def run_labelled_inference(split="val", max_scenes=None, scene_prefix=None,
                     "pred_R": pred_Rs[i], "pred_t": pred_t,
                     "pointnet_R": pred_Rs[i].copy(), "pointnet_t": pred_t.copy(),
                     "obs_pts": observed_points,
-                    "icp_obs_pts": _confidence_icp_points(
-                        observed_points, None if attention is None else attention[i],
-                        args.confidence_keep_ratio,
-                    ),
+                    "icp_obs_pts": observed_points,
                     "obj_name": obj_name, "obj_id": obj_id,
                     "scale": batch["scale"][i].numpy(), "objects_df": objects_df,
                     "icp_stages": args.icp_stages, "icp_threshold": args.icp_threshold,
@@ -240,7 +209,7 @@ def run_labelled_inference(split="val", max_scenes=None, scene_prefix=None,
                     "gt_R": batch["gt_rot"][i].numpy(),
                     "gt_t": centroid + batch["gt_t_residual"][i].numpy(),
                     "valid_points": batch["valid_points"][i].item(),
-                    "sym": loss_utils.get_object_symmetry(obj_name),
+                    "sym": pose_losses.get_object_symmetry(obj_name),
                     "rgb_path": rgb_path, "obj_dims": batch["obj_dims"][i].numpy(),
                     "K": batch["intrinsic"][i].numpy(),
                 })
@@ -248,22 +217,22 @@ def run_labelled_inference(split="val", max_scenes=None, scene_prefix=None,
     if refine_with_icp and samples:
         icp.run_icp_refinement(samples, use_icp=True)
 
-    summary = summarize_labelled_predictions(samples)
+    summary = summarize_labelled_predictions(samples, model_name=model_name)
     print(f"Evaluated {len(samples)} objects from {len(selected_scenes)} {split} scene(s) on {device}.")
     return samples, summary
 
 
-def summarize_labelled_predictions(samples):
-    """Print and return mean PointNet-only and PointNet+ICP GT pose errors."""
+def summarize_labelled_predictions(samples, model_name="pointnet"):
+    """Print and return initializer-only and initializer+ICP GT pose errors."""
     if not samples:
         raise ValueError("No samples were available to summarize.")
 
     pointnet_rot, pointnet_trans, final_rot, final_trans = [], [], [], []
     for sample in samples:
-        pointnet_rot.append(loss_utils.compute_symmetry_aware_loss(
+        pointnet_rot.append(pose_losses.compute_symmetry_aware_loss(
             sample["pointnet_R"], sample["gt_R"], sample["sym"]))
         pointnet_trans.append(np.linalg.norm(sample["pointnet_t"] - sample["gt_t"]) * 100)
-        final_rot.append(loss_utils.compute_symmetry_aware_loss(
+        final_rot.append(pose_losses.compute_symmetry_aware_loss(
             sample["pred_R"], sample["gt_R"], sample["sym"]))
         final_trans.append(np.linalg.norm(sample["pred_t"] - sample["gt_t"]) * 100)
 
@@ -271,9 +240,10 @@ def summarize_labelled_predictions(samples):
         "pointnet": {"mean_rot_deg": float(np.mean(pointnet_rot)), "mean_trans_cm": float(np.mean(pointnet_trans))},
         "pointnet_icp": {"mean_rot_deg": float(np.mean(final_rot)), "mean_trans_cm": float(np.mean(final_trans))},
     }
-    print(f"PointNet:       mean rotation {summary['pointnet']['mean_rot_deg']:.2f} deg | "
+    initializer = "RGB fusion" if model_name == "fusion" else "PointNet"
+    print(f"{initializer}:       mean rotation {summary['pointnet']['mean_rot_deg']:.2f} deg | "
           f"mean translation {summary['pointnet']['mean_trans_cm']:.2f} cm")
-    print(f"PointNet + ICP: mean rotation {summary['pointnet_icp']['mean_rot_deg']:.2f} deg | "
+    print(f"{initializer} + ICP: mean rotation {summary['pointnet_icp']['mean_rot_deg']:.2f} deg | "
           f"mean translation {summary['pointnet_icp']['mean_trans_cm']:.2f} cm")
     return summary
 
@@ -306,10 +276,8 @@ def evaluate_validation(checkpoint_path, *, quarter_turn_fallback=False,
     """Evaluate a checkpoint once and build its instance/object/scene reports."""
     label = "quarter-turn ICP fallback" if quarter_turn_fallback else "standard guarded ICP"
     if output_path is None:
-        output_path = (
-            "outputs/val_quarter_turn_icp_report.csv"
-            if quarter_turn_fallback else "outputs/val_instance_error_report.csv"
-        )
+        suffix = "quarter_turn_icp" if quarter_turn_fallback else "instance_error"
+        output_path = f"outputs/val_{model_name}_{suffix}_report.csv"
 
     samples, metrics = run_labelled_inference(
         split="val",

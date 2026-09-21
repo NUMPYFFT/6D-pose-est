@@ -64,6 +64,33 @@ The inverse transforms are $T_{cw}=T_{wc}^{-1}$ and $T_{wo}=T_{ow}^{-1}$. Networ
 
 The dataset contains cluttered tabletop RGB-D scenes captured with a Kinect-style camera. Each scene provides a color image, aligned depth image, per-pixel instance-label image, camera extrinsic matrix, and metadata identifying the visible objects. Each known object class also has a canonical mesh, physical dimensions, and a scale factor. Labelled train and validation scenes include world-frame object poses; the held-out test scenes omit poses and are used only for qualitative inference. The model is class-conditioned over 79 object categories and learns from visible object instances rather than entire scenes.
 
+### Object models and metadata
+
+`models.zip` supplies one canonical object directory per class and
+`models/objects_v1.csv` supplies the catalog connecting scene labels to those
+assets. The pipeline uses its fields as follows:
+
+| Field or asset | Use in the pipeline |
+|---|---|
+| `object` | Joins a scene's object name to the catalog row and canonical model |
+| `location` | Locates `<location>/visual_meshes/visual.dae` |
+| `width`, `length`, `height` | Defines the canonical 3D box drawn in pose visualizations |
+| `geometric_symmetry` | Seeds symmetry metadata during preprocessing; the final loss/evaluation table contains manually verified corrections |
+| scene metadata `scales` | Applies the instance scale to canonical points before ICP |
+| `.dae` mesh geometry | Supplies the canonical-space source surface for ICP |
+| texture image | Available to the renderer but not used by geometry-only ICP |
+
+The current method does not directly consume the catalog's `class`, `source`,
+`metric`, coordinate bounds, or `visual_symmetry` fields. RGB–point fusion uses the
+observed masked RGB crop, not the canonical mesh texture.
+
+To avoid drawing a different source cloud on every run, preprocessing samples
+exactly 10,000 surface points per mesh with an object-name-derived deterministic
+seed. The unscaled arrays are stored under `models/canonical_point_cache/`. At
+inference, the scene scale is applied, the cloud is voxel-downsampled to 5 mm, and
+normals are estimated for point-to-plane ICP. All 79 catalog objects are cached;
+existing files are skipped and a missing file is rebuilt automatically.
+
 Masked depth is back-projected with $K$, voxel-downsampled, and sampled to 1,024 points. Each point contains XYZ, RGB, and camera-oriented normals:
 
 $$[x,y,z,r,g,b,n_x,n_y,n_z].$$
@@ -137,7 +164,7 @@ $$\mathcal{L}_{axis}=\cos^{-1}\left((\hat R\mathbf{a})^T(R\mathbf{a})\right).$$
 - For continuous symmetry, the loss measures symmetry-axis alignment instead of arbitrary spin.
 - Symmetric point matching uses closest points, so equivalent surfaces are not penalized.
 
-The minimum above is **not** an unconstrained “best of $N$” prediction rule. The set $\mathcal{S}$ is fixed by the object's known physical symmetry, so every candidate $RS$ is an objectively equivalent ground-truth pose. An arbitrary best-of-$N$ loss would let a model propose unrelated poses and receive credit for whichever happens to be closest; it also requires a separate confidence/ranking mechanism at inference. Our multi-hypothesis experiment tested that direction and did not reliably rank candidates. Using the known symmetry group instead gives a single, well-defined symmetry-invariant target, stable gradients, and a metric that matches the object's geometry.
+The minimum above is **not** an unconstrained “best of $N$” prediction rule. The set $\mathcal{S}$ is fixed by the object's known physical symmetry, so every candidate $RS$ is an objectively equivalent ground-truth pose. An arbitrary best-of-$N$ loss could reward unrelated pose proposals and would require a separate ranking mechanism at inference. Using the known symmetry group instead gives a single, well-defined symmetry-invariant target, stable gradients, and a metric that matches the object's geometry.
 
 For continuous symmetry, enumerating a finite number of rotations would introduce an arbitrary angular discretization. Axis alignment removes that artificial resolution choice: any rotation around the object's continuous symmetry axis is treated as equivalent, while tilting the axis is penalized. This is both physically correct and computationally cheaper than searching many sampled rotations.
 
@@ -158,6 +185,29 @@ $$E(R,\mathbf{t})=\sum_i\left[\mathbf{n}_i^T(R\mathbf{p}_i+\mathbf{t}-\mathbf{q}
 where $\mathbf{p}_i$ is a mesh point, $\mathbf{q}_i$ is its matched observed point, and $\mathbf{n}_i$ is the target normal. The acceptance guard requires a competitive registration score and
 
 $$\angle(\hat R^T R_{ICP})\leq10^\circ, \qquad \|\hat{\mathbf{t}}-\mathbf{t}_{ICP}\|\leq0.01\text{ m}.$$
+
+### Runtime optimizations
+
+The implementation reduces repeated CPU and I/O work at several levels:
+
+1. RGB-D back-projection, object masking, 5 mm voxel downsampling, color extraction,
+   and normal estimation are performed once and saved as per-instance NPZ caches.
+2. The optional packed cache stores variable-length point arrays in shared,
+   read-only memory-mapped NumPy files. Windows DataLoader workers therefore avoid
+   repeatedly opening and decompressing thousands of small NPZ files.
+3. Training uses persistent workers, four-batch prefetching, pinned host memory,
+   non-blocking GPU transfers, and a configurable worker count and batch size.
+4. CUDA training uses automatic mixed precision, cuDNN benchmarking, and high
+   float32 matrix-multiplication precision settings.
+5. The deterministic canonical cache removes repeated COLLADA parsing and surface
+   sampling. Scaled Open3D source clouds are also retained in a process-local cache
+   keyed by object and scale.
+6. ICP processes objects concurrently and uses progressively tighter 1.0, 0.5, and
+   0.25 cm correspondence thresholds. The expensive refinement remains outside the
+   neural training loop and is run only for inference/evaluation.
+
+These changes primarily reduce data-loading and preprocessing latency; they do not
+change the learned pose objective or the reported evaluation protocol.
 
 ## 4. Experiment
 
@@ -209,8 +259,6 @@ Large orientation ambiguity under occlusion remains difficult. In `2-6-3`, the s
 
 ![Side-lying failure across ablations](outputs/ablation_visual_2-6-3_mustard_bottle.png)
 
-Canonical-source soft correspondence, four-hypothesis PointNet, per-point confidence weighting, and hard-example replay fine-tuning did not improve the main table. They are retained as negative ablations; the validated gain comes from reliable local geometric refinement rather than architecture complexity.
-
 ## 8. Future Work
 
 1. Collect or synthesize more realistic side-lying and heavily occluded examples.
@@ -223,6 +271,7 @@ Canonical-source soft correspondence, four-hypothesis PointNet, per-point confid
 
 ```bash
 python pose_pipeline.py ablations
+python pose_pipeline.py build-canonical-cache
 python pose_pipeline.py visualize-failure --scene 2-6-3 --object mustard_bottle
 python pose_pipeline.py visualize-icp --model pointnet
 python pose_pipeline.py visualize-icp --model fusion

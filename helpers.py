@@ -4,11 +4,10 @@ def get_config(args=None):
     parser = argparse.ArgumentParser(description="6D Pose Estimation Configuration")
 
     # Model
-    parser.add_argument("--model", type=str, default="pointnet", choices=["pointnet", "confidence", "fusion", "correspondence", "multihypothesis"], help="Model architecture")
+    parser.add_argument("--model", type=str, default="pointnet", choices=["pointnet", "fusion"], help="Model architecture")
     parser.add_argument("--num_points", type=int, default=1024, help="Number of points to sample")
     parser.add_argument("--num_classes", type=int, default=79, help="Number of object classes")
     parser.add_argument("--image_size", type=int, default=160, help="Masked RGB crop size for the fusion model")
-    parser.add_argument("--num_source_points", type=int, default=512, help="Canonical points for correspondence model")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
@@ -23,21 +22,12 @@ def get_config(args=None):
                         help="When fine-tuning, select the best checkpoint from this run rather than comparing to the source checkpoint's validation loss.")
     parser.add_argument("--snapshot_every", type=int, default=0,
                         help="Save a periodic checkpoint every N epochs (0 disables snapshots).")
-    parser.add_argument("--hard_indices", type=str, default=None,
-                        help="Optional .npy dataset indices to replay more often during training.")
-    parser.add_argument("--hard_replay_factor", type=float, default=4.0,
-                        help="Relative sampler weight assigned to mined hard examples.")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
     
     # Loss Weights
     parser.add_argument("--w_pm", type=float, default=1.0, help="Weight for Point Matching Loss")
     parser.add_argument("--w_geo", type=float, default=1.0, help="Weight for Geodesic Loss")
     parser.add_argument("--w_trans", type=float, default=1.0, help="Weight for Translation Loss")
-    parser.add_argument("--w_corr", type=float, default=0.25, help="Auxiliary correspondence-pose loss weight")
-    parser.add_argument("--w_conf", type=float, default=0.25, help="Multi-hypothesis confidence classification loss weight")
-    parser.add_argument("--w_diversity", type=float, default=0.05, help="Multi-hypothesis rotation diversity loss weight")
-    parser.add_argument("--confidence_keep_ratio", type=float, default=0.70,
-                        help="Fraction of highest-confidence observed points retained for ICP (confidence model only)")
 
     # Evaluation / ICP
     parser.add_argument("--no_icp", action="store_true", help="Disable ICP refinement")
@@ -150,41 +140,6 @@ def build_mmap_cache(data_dir, split, expected_samples=None):
     return target_dir
 
 
-"""Cached canonical mesh sampling for source-conditioned pose models."""
-
-from pathlib import Path
-
-import numpy as np
-import trimesh
-
-
-_SOURCE_CACHE = {}
-
-
-def canonical_points(object_name, objects_df, scale, num_points=512):
-    """Return a fixed-size canonical object cloud, scaled as in the dataset.
-
-    The module cache is intentionally process-local: Windows DataLoader workers
-    open a mesh at most once for a given object/scale pair and subsequently only
-    return inexpensive copies of the sampled points.
-    """
-    scale = np.asarray(scale, dtype=np.float32).reshape(-1)
-    if scale.size == 1:
-        scale = np.repeat(scale, 3)
-    key = (str(object_name), tuple(np.round(scale, 6)), int(num_points))
-    if key not in _SOURCE_CACHE:
-        row = objects_df[objects_df["object"] == object_name]
-        if row.empty:
-            raise KeyError(f"Canonical mesh is not listed for {object_name!r}.")
-        mesh_path = Path(str(row.iloc[0]["location"])) / "visual_meshes" / "visual.dae"
-        if not mesh_path.exists():
-            raise FileNotFoundError(f"Canonical mesh is missing: {mesh_path}")
-        mesh = trimesh.load(mesh_path, force="mesh")
-        points = mesh.sample(num_points).astype(np.float32) * scale[None, :]
-        _SOURCE_CACHE[key] = points
-    return _SOURCE_CACHE[key].copy()
-
-
 import os
 import numpy as np
 import torch
@@ -209,8 +164,7 @@ def get_split_files(split_name, data_dir, split_dir):
 
 class PoseDataset(Dataset):
     def __init__(self, split_name, data_dir, split_dir, num_points=4096, subset_size=None,
-                 return_image=False, image_size=160, return_source=False,
-                 num_source_points=512):
+                 return_image=False, image_size=160):
         self.split_name = split_name
         self.rgb_files, self.depth_files, self.label_files, self.meta_files = \
             get_split_files(split_name, data_dir, split_dir)
@@ -218,8 +172,6 @@ class PoseDataset(Dataset):
         self.num_points = num_points
         self.return_image = return_image
         self.image_size = image_size
-        self.return_source = return_source
-        self.num_source_points = num_source_points
 
         # Load object info table
         self.objects_df = pd.read_csv("models/objects_v1.csv")
@@ -312,22 +264,6 @@ class PoseDataset(Dataset):
         self._mmap_arrays = None
         if self.use_mmap_cache:
             print(f"Using shared memory-mapped cache from {self.mmap_dir}")
-
-        self.sample_object_names = None
-        if self.return_source:
-            # The regular point cache predates source-conditioned models and does
-            # not store object names. Resolve the small scene-level mapping once,
-            # rather than reopening metadata for every training sample.
-            names_by_scene = {}
-            self.sample_object_names = []
-            for scene_idx, object_id in self.samples:
-                if scene_idx not in names_by_scene:
-                    with open(self.meta_files[scene_idx], "rb") as handle:
-                        meta = pickle.load(handle)
-                    names_by_scene[scene_idx] = dict(zip(
-                        list(meta["object_ids"]), list(meta["object_names"])
-                    ))
-                self.sample_object_names.append(names_by_scene[scene_idx][object_id])
 
     def __len__(self):
         return len(self.samples)
@@ -693,11 +629,6 @@ class PoseDataset(Dataset):
             )
             result['image'] = torch.from_numpy(image)
             result['pixel_coords'] = torch.from_numpy(pixel_coords)
-        if self.return_source:
-            result['source_points'] = torch.from_numpy(canonical_points(
-                self.sample_object_names[idx], self.objects_df, scale,
-                num_points=self.num_source_points,
-            ))
         return result
 
 
@@ -883,16 +814,16 @@ import os
 import numpy as np
 import pandas as pd
 
-import model as loss_utils
+import pose_losses
 
 
 def build_error_report(samples, rotation_threshold_deg=5.0, translation_threshold_cm=1.0):
     """Return one diagnostic row per object instance, ordered from worst to best."""
     rows = []
     for sample in samples:
-        pointnet_rot = loss_utils.compute_symmetry_aware_loss(sample["pointnet_R"], sample["gt_R"], sample["sym"])
+        pointnet_rot = pose_losses.compute_symmetry_aware_loss(sample["pointnet_R"], sample["gt_R"], sample["sym"])
         pointnet_trans = np.linalg.norm(sample["pointnet_t"] - sample["gt_t"]) * 100
-        final_rot = loss_utils.compute_symmetry_aware_loss(sample["pred_R"], sample["gt_R"], sample["sym"])
+        final_rot = pose_losses.compute_symmetry_aware_loss(sample["pred_R"], sample["gt_R"], sample["sym"])
         final_trans = np.linalg.norm(sample["pred_t"] - sample["gt_t"]) * 100
         final_pass = final_rot <= rotation_threshold_deg and final_trans <= translation_threshold_cm
         rows.append({

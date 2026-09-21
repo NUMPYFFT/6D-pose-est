@@ -4,18 +4,84 @@ import trimesh
 import open3d as o3d
 import threading
 import concurrent.futures
+import hashlib
+from pathlib import Path
 from tqdm import tqdm
 
 # Global cache for canonical models to avoid reloading in workers
 _canonical_model_cache = {}
 _cache_lock = threading.Lock()
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_CANONICAL_CACHE_DIR = _PROJECT_ROOT / "models" / "canonical_point_cache"
+
+
+def _canonical_cache_path(obj_name):
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(obj_name))
+    return _CANONICAL_CACHE_DIR / f"{safe_name}.npz"
+
+
+def _mesh_path_from_row(row):
+    location = Path(str(row["location"]))
+    if not location.is_absolute():
+        location = _PROJECT_ROOT / location
+    return location / "visual_meshes" / "visual.dae"
+
+
+def _sample_mesh_deterministically(obj_name, row, num_points=10000):
+    """Sample a reproducible canonical cloud directly from one object mesh."""
+    mesh_path = _mesh_path_from_row(row)
+    if not mesh_path.is_file():
+        raise FileNotFoundError(f"Canonical mesh is missing: {mesh_path}")
+    mesh = trimesh.load(mesh_path, force="mesh")
+    seed = int.from_bytes(hashlib.sha256(str(obj_name).encode("utf-8")).digest()[:4], "little")
+    points, _ = trimesh.sample.sample_surface(mesh, num_points, seed=seed)
+    return points.astype(np.float32)
+
+
+def build_canonical_point_cache(objects_df, num_points=10000, overwrite=False):
+    """Build one deterministic, unscaled mesh-surface cloud per catalog object."""
+    _CANONICAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    built = skipped = failed = 0
+    for _, row in tqdm(
+        objects_df.iterrows(), total=len(objects_df), desc="Canonical mesh cache", unit="object"
+    ):
+        obj_name = str(row["object"])
+        cache_path = _canonical_cache_path(obj_name)
+        if cache_path.is_file() and not overwrite:
+            skipped += 1
+            continue
+        try:
+            points = _sample_mesh_deterministically(obj_name, row, num_points=num_points)
+            np.savez_compressed(cache_path, points=points)
+            built += 1
+        except Exception as exc:
+            failed += 1
+            print(f"[WARN] Could not cache {obj_name}: {exc}")
+    print(f"Canonical cache ready: {built} built, {skipped} existing, {failed} failed.")
+    return {"built": built, "skipped": skipped, "failed": failed}
+
+
+def _load_cached_canonical_points(obj_name, row, num_points=10000):
+    cache_path = _canonical_cache_path(obj_name)
+    with _cache_lock:
+        if not cache_path.is_file():
+            _CANONICAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            points = _sample_mesh_deterministically(obj_name, row, num_points=num_points)
+            np.savez_compressed(cache_path, points=points)
+        with np.load(cache_path) as cached:
+            return cached["points"].astype(np.float32, copy=True)
 
 # -------------------------------------------------------------------------
 # Load canonical model using CSV['location']
 # -------------------------------------------------------------------------
 def load_canonical_model_from_csv(obj_name, objects_df, scale):
+    scale_array = None
+    if scale is not None:
+        scale_array = np.asarray(scale, dtype=np.float32).reshape(-1)
+        if scale_array.size == 1:
+            scale_array = np.repeat(scale_array, 3)
     # Check cache first
-    cache_key = (obj_name, tuple(scale) if scale is not None else None)
+    cache_key = (obj_name, tuple(scale_array) if scale_array is not None else None)
     with _cache_lock:
         if cache_key in _canonical_model_cache:
             return _canonical_model_cache[cache_key]
@@ -25,28 +91,15 @@ def load_canonical_model_from_csv(obj_name, objects_df, scale):
         print(f"[WARN] Object {obj_name} not found in CSV.")
         return None
 
-    model_rel_path = row.iloc[0]['location']
-    model_path = os.path.join(model_rel_path, "visual_meshes", "visual.dae")
-
-    if not os.path.exists(model_path):
-        # try with leading './'
-        alt_path = os.path.join(".", model_rel_path, "visual_meshes", "visual.dae")
-        if os.path.exists(alt_path):
-            model_path = alt_path
-        else:
-            print(f"[WARN] canonical mesh not found: {model_path}")
-            return None
-
     try:
-        mesh = trimesh.load(model_path, force='mesh')
-        pts = mesh.sample(10000).astype(np.float32)
+        pts = _load_cached_canonical_points(obj_name, row.iloc[0])
     except Exception as e:
-        print(f"[ERROR] Failed to load {model_path}: {e}")
+        print(f"[ERROR] Failed to load canonical points for {obj_name}: {e}")
         return None
 
     # Apply scale
-    if scale is not None:
-        pts = pts * scale
+    if scale_array is not None:
+        pts = pts * scale_array[None, :]
 
     # Convert to Open3D PCD
     pcd = o3d.geometry.PointCloud()
@@ -570,8 +623,7 @@ def process_icp_sample(data):
     """
     pred_R = data['pred_R']
     pred_t = data['pred_t']
-    # ConfidencePointNet optionally supplies a high-reliability subset for
-    # registration. Keep data['obs_pts'] untouched for metrics and plots.
+    # Keep the registration cloud separate from the full visualization cloud.
     obs_pts = data.get('icp_obs_pts', data['obs_pts'])
     obj_name = data['obj_name']
     scale = data['scale']

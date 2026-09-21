@@ -294,8 +294,8 @@ def panel_image(target, rotation_key, translation_key, prediction_color):
 
 
 def pose_errors(target, rotation_key, translation_key):
-    import model as loss_utils
-    rot = loss_utils.compute_symmetry_aware_loss(
+    import pose_losses
+    rot = pose_losses.compute_symmetry_aware_loss(
         target[rotation_key], target["gt_R"], target["sym"]
     )
     trans = np.linalg.norm(target[translation_key] - target["gt_t"]) * 100.0
@@ -365,7 +365,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-import model as loss_utils
+import pose_losses
 
 import inference
 
@@ -433,7 +433,7 @@ def draw_panel(target, rotation_key, translation_key, color):
     if bounds is not None:
         x0, x1, y0, y1 = bounds
         image = image[y0:y1, x0:x1]
-    rotation = loss_utils.compute_symmetry_aware_loss(
+    rotation = pose_losses.compute_symmetry_aware_loss(
         target[rotation_key], target["gt_R"], target["sym"]
     )
     translation = np.linalg.norm(target[translation_key] - target["gt_t"]) * 100.0
@@ -466,9 +466,9 @@ def visualize_icp_improvements():
             candidate["scene"], candidate["object_name"], args.model,
             spec["checkpoint"], args.seed + candidate_index,
         )
-        init_rot = loss_utils.compute_symmetry_aware_loss(
+        init_rot = pose_losses.compute_symmetry_aware_loss(
             target["pointnet_R"], target["gt_R"], target["sym"])
-        final_rot = loss_utils.compute_symmetry_aware_loss(
+        final_rot = pose_losses.compute_symmetry_aware_loss(
             target["pred_R"], target["gt_R"], target["sym"])
         init_trans = np.linalg.norm(target["pointnet_t"] - target["gt_t"]) * 100.0
         final_trans = np.linalg.norm(target["pred_t"] - target["gt_t"]) * 100.0

@@ -3,7 +3,8 @@
 Examples
 --------
 python pose_pipeline.py train --epochs 400
-python pose_pipeline.py evaluate
+python pose_pipeline.py evaluate --model pointnet
+python pose_pipeline.py evaluate --model fusion
 python pose_pipeline.py ablations
 python pose_pipeline.py visualize-failure
 python pose_pipeline.py infer-test
@@ -20,8 +21,10 @@ import helpers
 from train import train
 
 
-BEST_CHECKPOINT = "model_weights/pointnet_occlusion_guarded_v1.pth"
-BEST_CHECKPOINT = "model_weights/pointnet_occlusion_guarded_nightly_ft_v2.pth"
+DEFAULT_CHECKPOINTS = {
+    "pointnet": "model_weights/pointnet_occlusion_guarded_nightly_ft_v2.pth",
+    "fusion": "model_weights/point_image_fusion_v1.pth",
+}
 
 
 def main():
@@ -38,13 +41,19 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("train", help="Train the PointNet baseline; accepts train.py options")
-    eval_parser = subparsers.add_parser("evaluate", help="Evaluate PointNet + guarded ICP on validation")
-    eval_parser.add_argument("--checkpoint", default=BEST_CHECKPOINT)
+    eval_parser = subparsers.add_parser("evaluate", help="Evaluate an initializer with guarded ICP on validation")
+    eval_parser.add_argument("--model", choices=sorted(DEFAULT_CHECKPOINTS), default="pointnet")
+    eval_parser.add_argument(
+        "--checkpoint", default=None,
+        help="Optional checkpoint override; otherwise the selected model's default is used",
+    )
     subparsers.add_parser("ablations", help="Run the four-way full-validation ablation")
     cache_parser = subparsers.add_parser("preprocess", help="Build point-cloud samples for a split")
     cache_parser.add_argument("--split", choices=["train", "val", "test"], required=True)
     fast_cache_parser = subparsers.add_parser("build-cache", help="Pack preprocessed samples into a memory-mapped cache")
     fast_cache_parser.add_argument("--split", choices=["train", "val", "test"], default="train")
+    canonical_parser = subparsers.add_parser("build-canonical-cache", help="Sample deterministic ICP clouds from all meshes")
+    canonical_parser.add_argument("--overwrite", action="store_true")
     failure_parser = subparsers.add_parser("visualize-failure", help="Render a four-method same-object comparison")
     failure_parser.add_argument("--scene", default="2-6-3")
     failure_parser.add_argument("--object", dest="object_name", default="mustard_bottle")
@@ -64,7 +73,8 @@ def main():
         finally:
             sys.argv = original_argv
     elif args.command == "evaluate":
-        result = inference.evaluate_validation(args.checkpoint)
+        checkpoint = args.checkpoint or DEFAULT_CHECKPOINTS[args.model]
+        result = inference.evaluate_validation(checkpoint, model_name=args.model)
         inference.display_summary(result)
     elif args.command == "ablations":
         original_argv = sys.argv
@@ -83,6 +93,8 @@ def main():
                 preprocess.build_fast_cache_main()
         finally:
             sys.argv = original_argv
+    elif args.command == "build-canonical-cache":
+        preprocess.build_canonical_cache_main(overwrite=args.overwrite)
     elif args.command == "visualize-failure":
         original_argv = sys.argv
         try:

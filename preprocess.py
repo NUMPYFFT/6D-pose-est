@@ -7,7 +7,10 @@ import open3d as o3d
 # Use the stable standard renderer instead of the VS Code notebook widget.
 from tqdm import tqdm
 import argparse
+from pathlib import Path
+import pandas as pd
 import helpers as config
+import icp
 from helpers import PoseDataset
 
 def preprocess_dataset(args):
@@ -17,6 +20,8 @@ def preprocess_dataset(args):
     # Force use_preprocessed=False to load raw data
     dataset = PoseDataset(split, args.training_data_dir, args.split_dir, num_points=args.num_points)
     dataset.use_preprocessed = False # FORCE RAW LOADING
+    # Build once and reuse in every ICP run; existing object caches are skipped.
+    icp.build_canonical_point_cache(dataset.objects_df)
     
     # Create output directory
     output_dir = os.path.join(args.training_data_dir, "preprocessed", split)
@@ -179,3 +184,10 @@ def build_fast_cache_main():
     dataset = PoseDataset(args.split, args.training_data_dir, args.split_dir,
                           num_points=args.num_points)
     build_mmap_cache(args.training_data_dir, args.split, expected_samples=len(dataset))
+
+
+def build_canonical_cache_main(overwrite=False):
+    """Build deterministic canonical point clouds without rebuilding scene caches."""
+    args = config.get_config(args=[])
+    objects_csv = Path(__file__).resolve().parent / args.objects_csv
+    return icp.build_canonical_point_cache(pd.read_csv(objects_csv), overwrite=overwrite)

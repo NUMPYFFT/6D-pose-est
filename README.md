@@ -24,18 +24,27 @@ For methodology, results, and the experiment plan, see [TECHNICAL_REPORT.md](TEC
 
 ## Project layout
 
-The eight Python modules have distinct roles:
-
-| File | Purpose |
-|---|---|
-| `preprocess.py` | Generate per-object point-cloud caches and the optional memory-mapped cache |
-| `helpers.py` | Configuration, dataset loading, augmentation, caching, and evaluation helpers |
-| `model.py` | PointNet and experimental models, plus pose and symmetry-aware losses |
-| `train.py` | Training loop, validation, checkpoints, and TensorBoard metrics |
-| `inference.py` | Labelled/test inference, error reports, and ablation comparisons |
-| `icp.py` | Canonical-mesh registration and guarded ICP refinement |
-| `visualization.py` | Scene overlays and comparison plots |
-| `pose_pipeline.py` | Command-line entry point for the main workflows |
+```text
+6D pose est/
+├── pose_pipeline.py       # Main command-line entry point
+├── preprocess.py          # Per-object and memory-mapped cache builders
+├── helpers.py             # Configuration, data, augmentation, and reports
+├── model.py               # PointNet and RGB-fusion architectures
+├── pose_losses.py         # Symmetry definitions, pose losses, and metrics
+├── train.py               # Training, validation, checkpoints, TensorBoard
+├── inference.py           # Evaluation, test inference, and ablations
+├── icp.py                 # Guarded geometric pose refinement
+├── visualization.py       # Scene overlays and comparison figures
+├── see_data.ipynb         # Dataset and coordinate-frame exploration
+├── pose_workflow.ipynb    # Interactive training/evaluation workflow
+├── model_weights/         # Retained trained checkpoints
+├── models/                # Canonical object meshes and metadata
+├── outputs/               # Numerical CSV reports and summary charts
+├── output_images/         # Qualitative pose visualizations
+├── runs/                  # TensorBoard logs
+├── TECHNICAL_REPORT.md    # Method, equations, experiments, and results
+└── requirements.txt       # Python dependencies
+```
 
 `see_data.ipynb` remains the data-exploration notebook. `pose_workflow.ipynb` is
 the compact interactive training/evaluation workflow. The methodological details
@@ -51,17 +60,22 @@ on another machine. Run commands from the project root:
 ```bash
 python pose_pipeline.py preprocess --split train
 python pose_pipeline.py preprocess --split val
+python pose_pipeline.py build-canonical-cache
 python pose_pipeline.py build-cache --split train
 python pose_pipeline.py train --epochs 400 --batch_size 128
-python pose_pipeline.py evaluate
+python pose_pipeline.py evaluate --model pointnet
+python pose_pipeline.py evaluate --model fusion
 python pose_pipeline.py ablations
 python pose_pipeline.py visualize-failure --scene 2-6-3 --object mustard_bottle
 python pose_pipeline.py visualize-icp --model pointnet
 python pose_pipeline.py infer-test --max-scenes 5
 ```
 
-Preprocessing may also be run for `--split test`. The memory-mapped cache is
-optional; it reduces repeated Windows file-open/decompression overhead. Training
+Preprocessing may also be run for `--split test`. Preprocessing automatically
+builds missing canonical mesh clouds; `build-canonical-cache` can also be run alone
+and safely skips existing objects. Use `--overwrite` to regenerate them. The
+memory-mapped scene cache is optional; it reduces repeated Windows file-open and
+decompression overhead. Training
 requires a CUDA-enabled PyTorch installation for practical speed. It reports
 compact epoch-level loss, rotation, and translation metrics, saves the best
 checkpoint to `model_weights/pointnet_new.pth` by default, and writes detailed
@@ -75,9 +89,11 @@ To fine-tune the retained baseline without overwriting it, for example:
 python pose_pipeline.py train --init_checkpoint model_weights/pointnet_occlusion_guarded_v1.pth --checkpoint_path model_weights/pointnet_finetuned_new.pth --lr 0.0001 --epochs 100
 ```
 
-`evaluate` uses `model_weights/pointnet_occlusion_guarded_v1.pth` by default.
-Pass `--checkpoint <path>` to evaluate another PointNet checkpoint; training a new
-checkpoint does not automatically change the evaluation default. `ablations`
+`evaluate --model pointnet` automatically uses
+`model_weights/pointnet_occlusion_guarded_nightly_ft_v2.pth`, while
+`evaluate --model fusion` uses `model_weights/point_image_fusion_v1.pth`. Pass
+`--checkpoint <path>` only when overriding the selected model's default. Training
+a new checkpoint does not automatically change these defaults. `ablations`
 compares PointNet, PointNet + guarded ICP, RGB--point fusion, and RGB--point fusion
 + guarded ICP on the same validation instances, writing a summary and per-instance
 CSV files under `outputs/`. The visualization commands render a selected failure
@@ -87,10 +103,10 @@ ground truth; it produces qualitative predictions only.
 The retained checkpoints are `pointnet_occlusion_guarded_v1.pth` (reported
 baseline), `point_image_fusion_v1.pth` (RGB fusion ablation), and
 `pointnet_occlusion_guarded_nightly_ft_v2.pth` (notebook fine-tuning selection).
-The earlier nightly v1 file is still present but is not used by a current default
-command. Correspondence, confidence, and multi-hypothesis model definitions remain
-in `model.py` as negative/experimental ablations; their discarded checkpoints are
-not needed for the main workflow.
+Only the PointNet and RGB-fusion architectures are retained in the active codebase.
+The primary checkpoints are `pointnet_occlusion_guarded_v1.pth` (reported baseline),
+`pointnet_occlusion_guarded_nightly_ft_v2.pth` (fine-tuned PointNet), and
+`point_image_fusion_v1.pth` (RGB-fusion ablation).
 
 ## Evaluate in notebooks
 
